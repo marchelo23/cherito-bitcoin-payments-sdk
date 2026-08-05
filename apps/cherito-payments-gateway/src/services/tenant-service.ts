@@ -1,4 +1,8 @@
+<<<<<<< HEAD
 import { randomUUID, randomBytes } from 'node:crypto'
+=======
+import { randomUUID } from 'node:crypto'
+>>>>>>> 9fb749e (feat: Payment Intent domain model (#3, #7))
 import { z } from 'zod'
 import type { TenantRepository, Tenant, PricingRule, MerchantApiKey } from '../persistence/tenant-repository.js'
 import type { ApiKeyService } from './api-key-service.js'
@@ -7,7 +11,11 @@ import type { ApiKeyService } from './api-key-service.js'
 // Input validation schemas
 // ---------------------------------------------------------------------------
 
+<<<<<<< HEAD
 const TENANT_NAME_RE = /^[\w\s'.-]{2,80}$/
+=======
+const TENANT_NAME_RE = /^[\w\s\-'.]{2,80}$/
+>>>>>>> 9fb749e (feat: Payment Intent domain model (#3, #7))
 
 const tenantCreateSchema = z
   .object({
@@ -128,10 +136,13 @@ export class TenantService {
       id: `tnt_${randomUUID()}`,
       name: parsed.name,
       disabled: false,
+<<<<<<< HEAD
       webhookUrl: null,
       webhookSecret: null,
       prevWebhookSecret: null,
       secretRotatedAt: null,
+=======
+>>>>>>> 9fb749e (feat: Payment Intent domain model (#3, #7))
       createdAt: now,
       updatedAt: now,
     }
@@ -243,6 +254,7 @@ export class TenantService {
 
   revokeApiKey(tenantId: string, keyId: string): void {
     this.repo.revokeApiKey(keyId, tenantId)
+<<<<<<< HEAD
   }
 
   // ---- Webhook Configuration -----------------------------------------------
@@ -258,5 +270,7 @@ export class TenantService {
     const newSecret = randomBytes(32).toString('hex')
     this.repo.updateWebhookConfig(tenantId, t.webhookUrl, newSecret, t.webhookSecret, new Date().toISOString())
     return this.repo.tenant(tenantId)!
+=======
+>>>>>>> 9fb749e (feat: Payment Intent domain model (#3, #7))
   }
 }

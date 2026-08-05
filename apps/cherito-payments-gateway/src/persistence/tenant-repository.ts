@@ -13,10 +13,13 @@ export interface Tenant {
   name: string
   /** If true the tenant is suspended and cannot create new invoices */
   disabled: boolean
+<<<<<<< HEAD
   webhookUrl: string | null
   webhookSecret: string | null
   prevWebhookSecret: string | null
   secretRotatedAt: string | null
+=======
+>>>>>>> 9fb749e (feat: Payment Intent domain model (#3, #7))
   createdAt: string
   updatedAt: string
 }
@@ -69,6 +72,7 @@ const TENANT_SCHEMA = `
   );
 
   CREATE TABLE IF NOT EXISTS tenants (
+<<<<<<< HEAD
     id            TEXT PRIMARY KEY,
     name          TEXT NOT NULL,
     disabled      INTEGER NOT NULL DEFAULT 0,
@@ -78,6 +82,13 @@ const TENANT_SCHEMA = `
     secret_rotated_at TEXT,
     created_at    TEXT NOT NULL,
     updated_at    TEXT NOT NULL
+=======
+    id          TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    disabled    INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+>>>>>>> 9fb749e (feat: Payment Intent domain model (#3, #7))
   );
 
   CREATE TABLE IF NOT EXISTS merchant_api_keys (
@@ -127,14 +138,23 @@ export class TenantRepository {
 
   createTenant(tenant: Tenant): void {
     this.db
+<<<<<<< HEAD
       .prepare('INSERT INTO tenants (id, name, disabled, webhook_url, webhook_secret, prev_webhook_secret, secret_rotated_at, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)')
       .run(tenant.id, tenant.name, tenant.disabled ? 1 : 0, tenant.webhookUrl, tenant.webhookSecret, tenant.prevWebhookSecret, tenant.secretRotatedAt, tenant.createdAt, tenant.updatedAt)
+=======
+      .prepare('INSERT INTO tenants VALUES (?,?,?,?,?)')
+      .run(tenant.id, tenant.name, tenant.disabled ? 1 : 0, tenant.createdAt, tenant.updatedAt)
+>>>>>>> 9fb749e (feat: Payment Intent domain model (#3, #7))
   }
 
   tenant(id: string): Tenant | undefined {
     const row = this.db
       .prepare(
+<<<<<<< HEAD
         `SELECT id, name, disabled, webhook_url webhookUrl, webhook_secret webhookSecret, prev_webhook_secret prevWebhookSecret, secret_rotated_at secretRotatedAt, created_at createdAt, updated_at updatedAt
+=======
+        `SELECT id, name, disabled, created_at createdAt, updated_at updatedAt
+>>>>>>> 9fb749e (feat: Payment Intent domain model (#3, #7))
          FROM tenants WHERE id=?`,
       )
       .get(id) as Record<string, unknown> | undefined
@@ -154,12 +174,15 @@ export class TenantRepository {
       .run(new Date().toISOString(), id)
   }
 
+<<<<<<< HEAD
   updateWebhookConfig(id: string, url: string | null, secret: string | null, prevSecret: string | null, rotatedAt: string | null): void {
     this.db
       .prepare(`UPDATE tenants SET webhook_url=?, webhook_secret=?, prev_webhook_secret=?, secret_rotated_at=?, updated_at=? WHERE id=?`)
       .run(url, secret, prevSecret, rotatedAt, new Date().toISOString(), id)
   }
 
+=======
+>>>>>>> 9fb749e (feat: Payment Intent domain model (#3, #7))
   // ---- API Keys (tenant-scoped) --------------------------------------------
 
   createApiKey(key: MerchantApiKey): void {

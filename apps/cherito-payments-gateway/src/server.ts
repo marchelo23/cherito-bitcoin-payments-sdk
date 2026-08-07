@@ -147,8 +147,9 @@ export async function buildServer(config: Config = loadConfig()): Promise<Return
   // ---- Recovery after restart ----------------------------------------------
   await paymentIntentService.recoverPendingIntents()
 
-  // ---- Start webhook retry loop -------------------------------------------
-  webhookService.startRetryLoop()
+  // ---- Start background jobs ----------------------------------------------
+  const stopReconciliation = paymentIntentService.startReconciliationLoop(60_000)
+  const stopRetry = webhookService.startRetryLoop()
 
   // ---- Fastify setup -------------------------------------------------------
   const app = Fastify({
@@ -169,6 +170,11 @@ export async function buildServer(config: Config = loadConfig()): Promise<Return
     },
     bodyLimit: 16_384,
     requestTimeout: 15_000,
+  })
+
+  app.addHook('onClose', async () => {
+    stopRetry()
+    stopReconciliation()
   })
 
   await app.register(cors, {

@@ -378,6 +378,15 @@ export class PaymentIntentService {
     await this.recoverPendingIntents()
   }
 
+  startReconciliationLoop(intervalMs = 300_000): () => void {
+    const timer = setInterval(() => {
+      void this.reconcile().catch((err) => {
+        console.error('Periodic reconciliation failed:', err)
+      })
+    }, intervalMs)
+    return () => clearInterval(timer)
+  }
+
   // ---- Public projections --------------------------------------------------
 
   toPublic(intent: PaymentIntent): PaymentIntentPublic {

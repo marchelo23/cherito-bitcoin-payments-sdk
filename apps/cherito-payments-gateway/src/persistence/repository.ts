@@ -442,11 +442,7 @@ export class Repository {
   constructor(url: string) {
     const file = url.replace(/^file:/, '')
     if (file.startsWith(':memory:')) {
-      const cache = (globalThis as typeof globalThis & { __sqlite_dbs?: Map<string, DatabaseSync> }).__sqlite_dbs ??= new Map<string, DatabaseSync>()
-      if (!cache.has(file)) {
-        cache.set(file, new DatabaseSync(':memory:'))
-      }
-      this.db = cache.get(file)!
+      this.db = new DatabaseSync(':memory:')
     } else {
       mkdirSync(dirname(file), { recursive: true })
       this.db = new DatabaseSync(file)

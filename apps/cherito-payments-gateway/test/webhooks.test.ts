@@ -1,11 +1,13 @@
 process.env.NODE_ENV = 'test'
 import { test, describe, afterEach, mock } from 'node:test'
 import assert from 'node:assert/strict'
-import { randomUUID, createHmac } from 'node:crypto'
+import { randomUUID, createHash, createHmac } from 'node:crypto'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { WebhookRepository } from '../src/persistence/webhook-repository.js'
+import { PaymentIntentRepository } from '../src/persistence/payment-intent-repository.js'
+import { PaymentIntentSecretCipher } from '../src/security/payment-intent-secret-cipher.js'
 import { TenantRepository } from '../src/persistence/tenant-repository.js'
 import { WebhookService } from '../src/services/webhook-service.js'
 import { TenantService } from '../src/services/tenant-service.js'
@@ -18,15 +20,47 @@ function setup() {
   const dbFile = `file:${join(directory, 'webhooks.sqlite')}`
   const webhookRepo = new WebhookRepository(dbFile)
   const tenantRepo = new TenantRepository(dbFile)
+  const paymentIntentRepo = new PaymentIntentRepository(
+    dbFile,
+    new PaymentIntentSecretCipher(Buffer.alloc(32, 0x77).toString('base64')),
+  )
   const webhookService = new WebhookService(webhookRepo, tenantRepo)
   const apiKeyService = new ApiKeyService(tenantRepo as never)
   const tenantService = new TenantService(tenantRepo, apiKeyService)
   setupCleanups.push(() => {
     webhookRepo.close()
     tenantRepo.close()
+    paymentIntentRepo.close()
     rmSync(directory, { recursive: true, force: true })
   })
-  return { webhookRepo, webhookService, tenantService }
+  const createTestIntent = (tenantId: string, id: string) => {
+    const now = new Date().toISOString()
+    const digest = createHash('sha256').update(id).digest('hex')
+    paymentIntentRepo.createPaymentIntent({
+      id,
+      tenantId,
+      merchantOrderId: null,
+      pricingRuleId: null,
+      paymentLinkId: null,
+      amountSats: '1000',
+      currency: 'SAT',
+      description: 'Webhook test intent',
+      metadata: null,
+      status: 'requires_payment',
+      paymentRequest: `lnbcrt_${digest}`,
+      paymentHash: digest,
+      providerInvoiceId: `provider_${digest}`,
+      intentSecret: digest,
+      clientSecretHash: digest,
+      idempotencyKey: null,
+      idempotencyPayloadHash: null,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      settledAt: null,
+      createdAt: now,
+      updatedAt: now,
+    })
+  }
+  return { webhookRepo, webhookService, tenantService, createTestIntent }
 }
 
 describe('WebhookService', () => {
@@ -36,12 +70,13 @@ describe('WebhookService', () => {
   })
 
   test('SSRF-safe: blocks localhost, private IP, and metadata server', async () => {
-    const { webhookRepo, webhookService, tenantService } = setup()
+    const { webhookRepo, webhookService, tenantService, createTestIntent } = setup()
     const { tenant } = await tenantService.createTenant({ name: 'SSRF Test' })
     tenantService.configureWebhookUrl(tenant.id, 'http://169.254.169.254/latest/meta-data/')
     tenantService.rotateWebhookSecret(tenant.id)
 
     const eventId = `evt_${randomUUID()}`
+    createTestIntent(tenant.id, 'pi_123')
     webhookRepo.createEvent({
       id: eventId,
       tenantId: tenant.id,
@@ -67,15 +102,16 @@ describe('WebhookService', () => {
     // This flush should catch the SSRF error and schedule a retry (mark as failed)
     await webhookService.flush()
     
-    const delivery = webhookRepo.delivery(deliveryId)
+    const delivery = webhookRepo.delivery(tenant.id, deliveryId)
     assert.equal(delivery?.status, 'failed', 'Should fail due to SSRF protection')
   })
 
   test('tenant-configurable: config changes take effect on next flush', async () => {
-    const { webhookRepo, webhookService, tenantService } = setup()
+    const { webhookRepo, webhookService, tenantService, createTestIntent } = setup()
     const { tenant } = await tenantService.createTenant({ name: 'Config Test' })
     
     const eventId = `evt_${randomUUID()}`
+    createTestIntent(tenant.id, 'pi_abc')
     webhookRepo.createEvent({
       id: eventId,
       tenantId: tenant.id,
@@ -100,7 +136,7 @@ describe('WebhookService', () => {
 
     // 1. Flush without config should permanently fail it (no URL)
     await webhookService.flush()
-    assert.equal(webhookRepo.delivery(deliveryId)?.status, 'permanently_failed')
+    assert.equal(webhookRepo.delivery(tenant.id, deliveryId)?.status, 'permanently_failed')
     
     // 2. We can configure and replay
     const server = await startTestServer()
@@ -108,7 +144,7 @@ describe('WebhookService', () => {
       tenantService.configureWebhookUrl(tenant.id, `http://127.0.0.1:${server.port}/webhook`)
       tenantService.rotateWebhookSecret(tenant.id)
       
-      await webhookService.replayEvent(eventId) // this creates a new delivery and flushes
+      await webhookService.replayEvent(tenant.id, eventId) // this creates a new delivery and flushes
       
       const deliveries = webhookRepo.pendingDeliveries()
       assert.equal(deliveries.length, 0, 'Should be delivered')
@@ -119,7 +155,7 @@ describe('WebhookService', () => {
   })
 
   test('signed and replay-resistant', async () => {
-    const { webhookRepo, webhookService, tenantService } = setup()
+    const { webhookRepo, webhookService, tenantService, createTestIntent } = setup()
     const { tenant } = await tenantService.createTenant({ name: 'Sig Test' })
     const server = await startTestServer()
     
@@ -128,6 +164,7 @@ describe('WebhookService', () => {
       const tWithSecret = tenantService.rotateWebhookSecret(tenant.id)
 
       const eventId = `evt_${randomUUID()}`
+      createTestIntent(tenant.id, 'pi_xyz')
       webhookRepo.createEvent({
         id: eventId,
         tenantId: tenant.id,
@@ -181,7 +218,7 @@ describe('WebhookService', () => {
       const isOldValid = WebhookService.verify(tWithSecret.webhookSecret!, oldHeader, '{"some":"data"}')
       assert.equal(isOldValid, false, 'Replay outside of tolerance should fail')
       
-      assert.equal(webhookRepo.delivery(deliveryId)?.status, 'delivered')
+      assert.equal(webhookRepo.delivery(tenant.id, deliveryId)?.status, 'delivered')
     } finally {
       server.close()
     }

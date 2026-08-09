@@ -9,7 +9,8 @@
     "typecheck": "pnpm --filter @cherito/bitcoin-sdk run build && pnpm -r run typecheck",
     "test": "pnpm -r run test",
     "lint": "eslint .",
-    "dev": "pnpm --filter cherito-payments-gateway run dev"
+    "dev": "pnpm --filter cherito-payments-gateway run dev",
+    "db": "pnpm --filter cherito-payments-gateway run db --"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.0",

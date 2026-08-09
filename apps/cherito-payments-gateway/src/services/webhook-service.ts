@@ -101,10 +101,10 @@ export class WebhookService {
 
   private async processDelivery(delivery: WebhookDelivery): Promise<void> {
     const tenant = this.tenantRepo.tenant(delivery.tenantId)
-    const event = this.webhookRepo.event(delivery.eventId)
+    const event = this.webhookRepo.event(delivery.tenantId, delivery.eventId)
     
     if (!tenant?.webhookUrl || !event) {
-      this.webhookRepo.markPermanentlyFailed(delivery.id)
+      this.webhookRepo.markPermanentlyFailed(delivery.tenantId, delivery.id)
       return
     }
 
@@ -116,7 +116,7 @@ export class WebhookService {
       // Try the current secret first
       const secret = tenant.webhookSecret
       if (!secret) {
-        this.webhookRepo.markPermanentlyFailed(delivery.id)
+        this.webhookRepo.markPermanentlyFailed(delivery.tenantId, delivery.id)
         return
       }
 
@@ -147,7 +147,7 @@ export class WebhookService {
       }
 
       if (response.ok) {
-        this.webhookRepo.markDelivered(delivery.id)
+        this.webhookRepo.markDelivered(delivery.tenantId, delivery.id)
       } else {
         this.scheduleRetry(delivery)
       }
@@ -161,8 +161,8 @@ export class WebhookService {
    * Allows manual replay of a webhook event.
    * Creates a new delivery record tied to the same event ID.
    */
-  async replayEvent(eventId: string): Promise<void> {
-    const event = this.webhookRepo.event(eventId)
+  async replayEvent(tenantId: string, eventId: string): Promise<void> {
+    const event = this.webhookRepo.event(tenantId, eventId)
     if (!event) throw new Error('Event not found')
     
     const now = new Date().toISOString()
@@ -225,7 +225,7 @@ export class WebhookService {
   private scheduleRetry(delivery: WebhookDelivery): void {
     const attempt = delivery.attemptCount
     if (attempt >= MAX_ATTEMPTS) {
-      this.webhookRepo.markPermanentlyFailed(delivery.id)
+      this.webhookRepo.markPermanentlyFailed(delivery.tenantId, delivery.id)
       return
     }
     
@@ -235,6 +235,6 @@ export class WebhookService {
     const delayMs = baseDelayMs + jitter
     
     const nextAttemptAt = new Date(Date.now() + delayMs).toISOString()
-    this.webhookRepo.markFailed(delivery.id, nextAttemptAt)
+    this.webhookRepo.markFailed(delivery.tenantId, delivery.id, nextAttemptAt)
   }
 }

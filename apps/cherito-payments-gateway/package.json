@@ -8,7 +8,8 @@
     "start": "node dist/server.js",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test test/*.test.ts"
+    "test": "node --import tsx --test test/*.test.ts",
+    "db": "tsx src/database-cli.ts"
   },
   "dependencies": {
     "@cherito/bitcoin-sdk": "workspace:*",

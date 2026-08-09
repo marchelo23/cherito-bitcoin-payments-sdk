@@ -1,6 +1,5 @@
 import {
   createHash,
-  createHmac,
   randomBytes,
   randomUUID,
   timingSafeEqual,
@@ -19,9 +18,11 @@ import {
 } from '../persistence/payment-intent-repository.js'
 import type { PricingRule } from '../persistence/tenant-repository.js'
 import type { TenantService } from './tenant-service.js'
+import {
+  derivePaymentIntentClientSecret,
+  hashPaymentIntentClientSecret,
+} from '../security/payment-intent-client-capability.js'
 
-const CLIENT_CAPABILITY_DOMAIN = 'cherito:payment-intent-client:v1'
-const CLIENT_CAPABILITY_HASH_DOMAIN = 'cherito:payment-intent-client-hash:v1'
 const IDEMPOTENCY_DOMAIN = 'cherito:payment-intent-idempotency:v1'
 const MAX_METADATA_BYTES = 4_096
 const MAX_DESCRIPTION_BYTES = 500
@@ -113,24 +114,6 @@ export interface PaymentIntentClientView {
 
 function sha256(value: string): string {
   return createHash('sha256').update(value).digest('hex')
-}
-
-function deriveClientSecret(intentSecret: string, intentId: string, tenantId: string): string {
-  if (!/^[a-f0-9]{64}$/.test(intentSecret)) {
-    throw new Error('Stored Payment Intent secret is invalid')
-  }
-  const digest = createHmac('sha256', Buffer.from(intentSecret, 'hex'))
-    .update(CLIENT_CAPABILITY_DOMAIN)
-    .update('\0')
-    .update(tenantId)
-    .update('\0')
-    .update(intentId)
-    .digest('base64url')
-  return `cs_v1_${digest}`
-}
-
-function hashClientSecret(clientSecret: string): string {
-  return sha256(`${CLIENT_CAPABILITY_HASH_DOMAIN}\0${clientSecret}`)
 }
 
 function normalizedString(value: string | undefined): string | undefined {
@@ -247,7 +230,7 @@ export class PaymentIntentService {
   ): PaymentIntent | undefined {
     const intent = this.repo.paymentIntent(tenantId, intentId)
     if (!intent) return undefined
-    const actual = Buffer.from(hashClientSecret(clientSecret), 'hex')
+    const actual = Buffer.from(hashPaymentIntentClientSecret(clientSecret), 'hex')
     const expected = Buffer.from(intent.clientSecretHash, 'hex')
     if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) return undefined
     return intent
@@ -405,7 +388,7 @@ export class PaymentIntentService {
     }
 
     const intentSecret = randomBytes(32).toString('hex')
-    const clientSecret = deriveClientSecret(intentSecret, intentId, tenantId)
+    const clientSecret = derivePaymentIntentClientSecret(intentSecret, intentId, tenantId)
     const now = new Date(this.now()).toISOString()
     const intent: PaymentIntent = {
       id: intentId,
@@ -422,7 +405,7 @@ export class PaymentIntentService {
       paymentHash: invoice.paymentHash,
       providerInvoiceId: invoice.providerInvoiceId,
       intentSecret,
-      clientSecretHash: hashClientSecret(clientSecret),
+      clientSecretHash: hashPaymentIntentClientSecret(clientSecret),
       idempotencyKey: idempotencyKey ?? null,
       idempotencyPayloadHash: idempotencyKey ? payloadHash : null,
       expiresAt: invoice.expiresAt,
@@ -521,7 +504,11 @@ export class PaymentIntentService {
   private createResponse(intent: PaymentIntent): PaymentIntentCreateResponse {
     return {
       ...this.toMerchant(intent),
-      clientSecret: deriveClientSecret(intent.intentSecret, intent.id, intent.tenantId),
+      clientSecret: derivePaymentIntentClientSecret(
+        intent.intentSecret,
+        intent.id,
+        intent.tenantId,
+      ),
     }
   }
 
@@ -609,6 +596,28 @@ export class PaymentIntentService {
   ): Promise<boolean> {
     if (!ALLOWED_TRANSITIONS[current.status].has(nextStatus)) return false
     const updatedAt = new Date(this.now()).toISOString()
+    const settledAt = nextStatus === 'succeeded'
+      ? (invoice?.settledAt ?? updatedAt)
+      : current.settledAt
+    const event = TERMINAL_STATUSES.has(nextStatus)
+      ? {
+          id: `we_${randomUUID()}`,
+          deliveryId: `wd_${randomUUID()}`,
+          type: `payment_intent.${nextStatus}`,
+          payload: canonicalJson({
+            amountSats: current.amountSats,
+            createdAt: current.createdAt,
+            currency: current.currency,
+            id: current.id,
+            merchantOrderId: current.merchantOrderId,
+            status: nextStatus,
+            settledAt,
+            tenantId: current.tenantId,
+            updatedAt,
+          }),
+          createdAt: updatedAt,
+        }
+      : undefined
     const changed = this.repo.transitionPaymentIntent({
       tenantId: current.tenantId,
       paymentHash: current.paymentHash,
@@ -616,6 +625,7 @@ export class PaymentIntentService {
       toStatus: nextStatus,
       invoice,
       updatedAt,
+      event,
     })
     if (!changed) return false
 

@@ -295,4 +295,8 @@ export class TenantRepository {
       .prepare(`UPDATE pricing_rules SET active=0, updated_at=? WHERE tenant_id=? AND product_id=?`)
       .run(new Date().toISOString(), tenantId, productId)
   }
+
+  close(): void {
+    this.db.close()
+  }
 }

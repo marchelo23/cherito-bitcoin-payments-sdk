@@ -12,7 +12,6 @@
  */
 import { test, describe } from 'node:test'
 import assert from 'node:assert/strict'
-import { randomUUID } from 'node:crypto'
 import { TenantRepository } from '../src/persistence/tenant-repository.js'
 import { TenantService } from '../src/services/tenant-service.js'
 import { ApiKeyService } from '../src/services/api-key-service.js'
@@ -23,7 +22,7 @@ import { ApiKeyService } from '../src/services/api-key-service.js'
 
 function makeRepo(): TenantRepository {
   // In-memory SQLite; each test gets its own instance
-  return new TenantRepository(`file::memory:?cache=shared&uri=${randomUUID()}`)
+  return new TenantRepository(':memory:')
 }
 
 function makeServices(repo: TenantRepository) {

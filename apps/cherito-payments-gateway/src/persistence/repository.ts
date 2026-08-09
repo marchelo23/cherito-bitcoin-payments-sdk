@@ -142,4 +142,8 @@ export class Repository {
         new Date().toISOString(),
       );
   }
+
+  close() {
+    this.db.close();
+  }
 }

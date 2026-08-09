@@ -52,6 +52,44 @@ export class WebhookService {
   ) {}
 
   /**
+   * Minimal Payment Intent outbox integration. Configuration management stays
+   * in the existing tenant/webhook services; this only records a deduplicated
+   * terminal event and its first durable delivery.
+   */
+  enqueuePaymentIntentEvent(
+    tenantId: string,
+    paymentIntentId: string,
+    type: string,
+    payload: string,
+  ): void {
+    const tenant = this.tenantRepo.tenant(tenantId)
+    if (!tenant?.webhookUrl || !tenant.webhookSecret) return
+    const now = new Date().toISOString()
+    const eventId = `we_${randomUUID()}`
+    this.webhookRepo.createEventAndDeliveryIfAbsent(
+      {
+        id: eventId,
+        tenantId,
+        paymentIntentId,
+        type,
+        payload,
+        createdAt: now,
+      },
+      {
+        id: `wd_${randomUUID()}`,
+        eventId,
+        tenantId,
+        status: 'pending',
+        attemptCount: 0,
+        lastAttemptAt: null,
+        nextAttemptAt: now,
+        deliveredAt: null,
+        createdAt: now,
+      },
+    )
+  }
+
+  /**
    * Process all pending webhook deliveries that are due.
    */
   async flush(): Promise<void> {

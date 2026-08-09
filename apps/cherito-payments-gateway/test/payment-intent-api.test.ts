@@ -198,25 +198,36 @@ test('merchant and client routes enforce authority boundaries', async () => {
   assert.equal(browserCreate.statusCode, 401)
 })
 
-test('empty-database bootstrap requires a protected file and never falls back to stdout', async () => {
-  const directory = mkdtempSync(join(tmpdir(), 'cherito-payment-intent-bootstrap-'))
-  const provider = new ApiProvider()
+test('production and development bootstrap require an explicit protected destination', async () => {
   const { buildServer } = await import('../src/server.js')
-  const config = configFor(directory)
-  config.BOOTSTRAP_KEY_PATH = undefined
-  const output: string[] = []
-  const originalLog = console.log
-  console.log = (...values: unknown[]) => output.push(values.map(String).join(' '))
-  try {
-    await assert.rejects(
-      buildServer(config, { lnd: provider, startBackgroundJobs: false }),
-      /BOOTSTRAP_KEY_PATH is required/,
-    )
-  } finally {
-    console.log = originalLog
-    rmSync(directory, { recursive: true, force: true })
+  for (const environment of ['production', 'development'] as const) {
+    const directory = mkdtempSync(join(tmpdir(), 'cherito-payment-intent-bootstrap-'))
+    const config = configFor(directory)
+    config.NODE_ENV = environment
+    config.BOOTSTRAP_KEY_PATH = undefined
+    const output: string[] = []
+    const originals = {
+      log: console.log,
+      info: console.info,
+      warn: console.warn,
+      error: console.error,
+    }
+    const capture = (...values: unknown[]) => output.push(values.map(String).join(' '))
+    console.log = capture
+    console.info = capture
+    console.warn = capture
+    console.error = capture
+    try {
+      await assert.rejects(
+        buildServer(config, { lnd: new ApiProvider(), startBackgroundJobs: false }),
+        /BOOTSTRAP_KEY_PATH is required/,
+      )
+    } finally {
+      Object.assign(console, originals)
+      rmSync(directory, { recursive: true, force: true })
+    }
+    assert.deepEqual(output, [])
   }
-  assert.deepEqual(output, [])
 })
 
 test('API accepts pricing rules, rejects floating-point amounts, and reports idempotency conflicts', async () => {

@@ -1,5 +1,25 @@
 import { z } from "zod";
 import { PaymentIntentSecretCipher } from './security/payment-intent-secret-cipher.js'
+
+const FORBIDDEN_WALLET_ENVIRONMENT_VARIABLES = [
+  'ADMIN_MACAROON',
+  'SEED',
+  'SEED_PHRASE',
+  'WALLET_SEED',
+  'MNEMONIC',
+  'XPRV',
+  'XPRIV',
+  'PRIVATE_KEY',
+] as const
+
+function isCanonicalBase64(value: string): boolean {
+  if (value.length === 0 || value.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(value)) {
+    return false
+  }
+  const decoded = Buffer.from(value, 'base64')
+  return decoded.length > 0 && decoded.toString('base64') === value
+}
+
 const schema = z.object({
   NODE_ENV: z
     .enum(["development", "test", "production"])
@@ -8,10 +28,14 @@ const schema = z.object({
   HOST: z.string().default("0.0.0.0"),
   LIGHTNING_PROVIDER: z.literal("lnd").default("lnd"),
   LND_REST_URL: z.string().url(),
-  LND_TLS_CERT_PATH: z.string().optional(),
-  LND_MACAROON_PATH: z.string().optional(),
-  LND_TLS_CERT_BASE64: z.string().optional(),
-  LND_MACAROON_HEX: z.string().optional(),
+  LND_TLS_CERT_PATH: z.string().min(1).optional(),
+  LND_MACAROON_PATH: z.string().min(1).optional(),
+  LND_TLS_CERT_BASE64: z.string().refine(isCanonicalBase64, {
+    message: 'LND_TLS_CERT_BASE64 must be canonical base64',
+  }).optional(),
+  LND_MACAROON_HEX: z.string().regex(/^(?:[0-9a-fA-F]{2})+$/, {
+    message: 'LND_MACAROON_HEX must contain complete hexadecimal bytes',
+  }).optional(),
   BOLT12_PROVIDER: z.enum(["none", "lndk"]).default("none"),
   LNDK_GRPC_URL: z.string().optional(),
   LNDK_TLS_CERT_PATH: z.string().optional(),
@@ -44,7 +68,7 @@ const schema = z.object({
 });
 export type Config = z.infer<typeof schema>;
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
-  for (const name of ["ADMIN_MACAROON", "SEED", "XPRV", "PRIVATE_KEY"])
+  for (const name of FORBIDDEN_WALLET_ENVIRONMENT_VARIABLES)
     if (env[name])
       throw new Error(`Unsafe configuration is forbidden: ${name}`);
   const c = schema.parse(env);
@@ -55,8 +79,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   );
   if (!c.LND_TLS_CERT_PATH && !c.LND_TLS_CERT_BASE64)
     throw new Error("LND TLS credential is required");
+  if (c.LND_TLS_CERT_PATH && c.LND_TLS_CERT_BASE64)
+    throw new Error('LND TLS credential source is ambiguous');
   if (!c.LND_MACAROON_PATH && !c.LND_MACAROON_HEX)
     throw new Error("Limited invoice macaroon is required");
+  if (c.LND_MACAROON_PATH && c.LND_MACAROON_HEX)
+    throw new Error('LND macaroon credential source is ambiguous');
   if (c.MIN_INVOICE_SATS > c.MAX_INVOICE_SATS)
     throw new Error("Invoice limits are inverted");
   if (c.PAYMENT_INTENT_WATCH_RETRY_BASE_MS > c.PAYMENT_INTENT_WATCH_RETRY_MAX_MS)

@@ -116,12 +116,12 @@ Cherito is a receive-only Lightning payment layer. It coordinates invoice creati
 
 ### T7: Admin Macaroon Exposure
 - **Attack**: Admin macaroon is used instead of limited invoice macaroon.
-- **Mitigation**: Gateway refuses to start if `ADMIN_MACAROON`, `SEED`, `XPRV`, or `PRIVATE_KEY` are set in environment. Only `invoices:read`, `invoices:write`, and `info:read` macaroon permissions are needed.
-- **Status**: ✅ Mitigated.
+- **Mitigation**: Gateway refuses known wallet-secret environment-variable names and ambiguous or malformed credential sources. Operators must bake and test a dedicated receive-only macaroon. Cherito cannot infer or cryptographically verify macaroon permissions from a variable name or byte encoding.
+- **Status**: ⚠️ Partially mitigated — least privilege remains an operator responsibility.
 
 ### T8: Log Injection / Credential Leak via Logs
 - **Attack**: Credentials appear in structured log output.
-- **Mitigation**: Fastify `redact` config removes `authorization`, `macaroon`, `certificate`, `clientSecretHash`, `webhookSecret`, `keyHash` from logs. Structured JSON logging prevents log injection. No `console.log` of sensitive values in production paths.
+- **Mitigation**: Production call sites construct bounded allowlisted events; automatic request logging and raw bodies are disabled. Nested secret fields are redacted as defense in depth, provider errors become stable categories, and user control characters remain inside one JSON event. Production paths do not use direct `console` output.
 - **Status**: ✅ Mitigated.
 
 ### T9: Payment Link Amount Override
@@ -140,7 +140,7 @@ Cherito is a receive-only Lightning payment layer. It coordinates invoice creati
 
 | Control                          | Location                          | Status  |
 |----------------------------------|-----------------------------------|---------|
-| Least-privilege macaroon         | Config validation                  | ✅       |
+| Least-privilege macaroon         | Operator bake/verification         | ⚠️       |
 | Forbidden env var check          | `config.ts`                       | ✅       |
 | API key hashing (SHA-256)        | `api-key-service.ts`              | ✅       |
 | Timing-safe key comparison       | `api-key-service.ts`              | ✅       |
@@ -153,7 +153,7 @@ Cherito is a receive-only Lightning payment layer. It coordinates invoice creati
 | TLS cert pinning                 | `lnd-rest-provider.ts`            | ✅       |
 | CORS allowlist                   | `server.ts`                       | ✅       |
 | Security response headers        | `server.ts` `onSend` hook         | ✅       |
-| Log redaction                    | `server.ts` Fastify config        | ✅       |
+| Log allowlist and redaction      | `logging/safe-logger.ts`          | ✅       |
 | Rate limiting (per-IP)           | `server.ts`                       | ✅       |
 | Request size limit (16KB)        | `server.ts` Fastify config        | ✅       |
 | Schema migration tracking        | `repository.ts`                   | ✅       |

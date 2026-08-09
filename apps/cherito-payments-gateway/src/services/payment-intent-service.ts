@@ -22,6 +22,12 @@ import {
   derivePaymentIntentClientSecret,
   hashPaymentIntentClientSecret,
 } from '../security/payment-intent-client-capability.js'
+import {
+  NOOP_SAFE_LOGGER,
+  safeLog,
+  safeProviderErrorCode,
+  type SafeLogger,
+} from '../logging/safe-logger.js'
 
 const IDEMPOTENCY_DOMAIN = 'cherito:payment-intent-idempotency:v1'
 const MAX_METADATA_BYTES = 4_096
@@ -60,7 +66,7 @@ export interface PaymentIntentServiceOptions {
   watcherRetryMaxMs?: number
   now?: () => number
   random?: () => number
-  logger?: Pick<Console, 'error'>
+  logger?: SafeLogger
 }
 
 export interface CreatePaymentIntentInput {
@@ -189,7 +195,7 @@ export class PaymentIntentService {
   private readonly watcherRetryMaxMs: number
   private readonly now: () => number
   private readonly random: () => number
-  private readonly logger: Pick<Console, 'error'>
+  private readonly logger: SafeLogger
   private reconciliationTimer: NodeJS.Timeout | undefined
   private reconciliationInFlight: Promise<void> | undefined
   private shuttingDown = false
@@ -211,7 +217,7 @@ export class PaymentIntentService {
     )
     this.now = options.now ?? Date.now
     this.random = options.random ?? Math.random
-    this.logger = options.logger ?? console
+    this.logger = options.logger ?? NOOP_SAFE_LOGGER
   }
 
   async create(input: CreatePaymentIntentInput): Promise<PaymentIntentCreateResponse> {
@@ -263,7 +269,7 @@ export class PaymentIntentService {
     this.stopReconciliationLoop()
     this.reconciliationTimer = setInterval(() => {
       void this.reconcile().catch((error: unknown) => {
-        this.logger.error('Payment Intent reconciliation failed', error)
+        this.logProviderFailure('payment_intent.reconciliation_failed', error)
       })
     }, Math.max(1, intervalMs))
     this.reconciliationTimer.unref?.()
@@ -278,7 +284,7 @@ export class PaymentIntentService {
     this.watcherRetryTimers.clear()
     this.watcherRetryAttempts.clear()
     await this.reconciliationInFlight?.catch((error: unknown) => {
-      this.logger.error('Payment Intent reconciliation shutdown failed', error)
+      this.logProviderFailure('payment_intent.reconciliation_shutdown_failed', error)
     })
     await Promise.allSettled([...this.watchers.keys()].map((hash) => this.stopWatcher(hash)))
     this.listeners.clear()
@@ -377,12 +383,18 @@ export class PaymentIntentService {
     const description = descriptionInput ?? pricing.description ?? `Payment ${intentId}`
     assertUtf8Bound(description, MAX_DESCRIPTION_BYTES, 'description')
 
-    const invoice = await this.provider.createInvoice({
-      orderId: intentId,
-      amountSats: pricing.amountSats,
-      memo: description.slice(0, 120),
-      expirySeconds: this.config.DEFAULT_INVOICE_EXPIRY_SECONDS,
-    })
+    let invoice: LightningInvoice
+    try {
+      invoice = await this.provider.createInvoice({
+        orderId: intentId,
+        amountSats: pricing.amountSats,
+        memo: description.slice(0, 120),
+        expirySeconds: this.config.DEFAULT_INVOICE_EXPIRY_SECONDS,
+      })
+    } catch (error) {
+      this.logProviderFailure('payment_intent.invoice_creation_failed', error)
+      throw paymentIntentError(502, 'PROVIDER_UNAVAILABLE', 'Lightning provider unavailable')
+    }
     if (invoice.amountSats !== pricing.amountSats) {
       throw paymentIntentError(502, 'PROVIDER_AMOUNT_MISMATCH', 'Provider returned a different amount')
     }
@@ -557,7 +569,7 @@ export class PaymentIntentService {
       providerInvoice = await this.provider.getInvoice(intent.paymentHash)
       await this.applyProviderInvoice(intent.tenantId, intent.paymentHash, providerInvoice)
     } catch (error) {
-      this.logger.error('Payment Intent provider reconciliation failed', error)
+      this.logProviderFailure('payment_intent.provider_reconciliation_failed', error)
     }
 
     const current = this.repo.paymentIntentByHash(intent.tenantId, intent.paymentHash)
@@ -673,14 +685,14 @@ export class PaymentIntentService {
     try {
       const cleanup = await this.provider.subscribeToInvoice(intent.paymentHash, (invoice) => {
         void this.applyProviderInvoice(intent.tenantId, intent.paymentHash, invoice).catch(
-          (error: unknown) => this.logger.error('Payment Intent watcher callback failed', error),
+          (error: unknown) => this.logProviderFailure('payment_intent.watcher_callback_failed', error),
         )
       })
       entry.cleanup = cleanup
       this.watcherRetryAttempts.delete(intent.paymentHash)
       if (entry.stopRequested || this.shuttingDown || !this.watchers.has(intent.paymentHash)) {
         await cleanup().catch((error: unknown) => {
-          this.logger.error('Payment Intent watcher cleanup failed', error)
+          this.logProviderFailure('payment_intent.watcher_cleanup_failed', error)
         })
         this.watchers.delete(intent.paymentHash)
       }
@@ -688,7 +700,7 @@ export class PaymentIntentService {
       if (this.watchers.get(intent.paymentHash) === entry) {
         this.watchers.delete(intent.paymentHash)
       }
-      this.logger.error('Payment Intent watcher subscription failed', error)
+      this.logProviderFailure('payment_intent.watcher_subscription_failed', error)
       this.scheduleWatcherRetry(intent)
     }
   }
@@ -700,7 +712,7 @@ export class PaymentIntentService {
     this.watchers.delete(paymentHash)
     if (watcher.cleanup) {
       await watcher.cleanup().catch((error: unknown) => {
-        this.logger.error('Payment Intent watcher cleanup failed', error)
+        this.logProviderFailure('payment_intent.watcher_cleanup_failed', error)
       })
     }
   }
@@ -724,6 +736,15 @@ export class PaymentIntentService {
     }, delay)
     timer.unref?.()
     this.watcherRetryTimers.set(intent.paymentHash, timer)
+  }
+
+  private logProviderFailure(event: string, error: unknown): void {
+    safeLog(this.logger, 'error', {
+      event,
+      providerType: this.provider.providerType,
+      outcome: 'failure',
+      errorCode: safeProviderErrorCode(error),
+    }, 'Lightning operation failed')
   }
 
   private clearWatcherRetry(paymentHash: string): void {

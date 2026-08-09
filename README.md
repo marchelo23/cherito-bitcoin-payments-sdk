@@ -55,9 +55,11 @@ lncli bakemacaroon \
 ```
 
 Copy LND's `tls.cert` and this macaroon into `secrets/`; never use the admin
-macaroon. Mounted files take priority over `LND_TLS_CERT_BASE64` and
-`LND_MACAROON_HEX`. Missing credentials stop startup. The gateway also refuses
-known high-privilege or wallet-material environment settings.
+macaroon. Choose exactly one source (mounted file or inline value) for each
+credential; ambiguous or malformed sources stop startup. The gateway also refuses
+known high-privilege or wallet-material environment settings. These name and
+format checks cannot prove the macaroon's permissions, so verify least privilege
+against the installed LND version.
 
 Choose a URL whose hostname/IP exists in LND's certificate:
 
@@ -137,11 +139,13 @@ dispatches:
 
 ```js
 window.addEventListener('cherito:payment-settled', ({ detail }) => {
-  console.log(detail.checkoutSessionId, detail.orderId)
+  showOrderConfirmation(detail.orderId)
 })
 ```
 
 Do not send payment hashes, invoices, node data, or status tokens to analytics.
+See [Logging, privacy, and retention](docs/logging-and-privacy.md) for the exact log
+allowlist, diagnostics exposure, retention guidance, and remaining privacy work.
 
 ## Experimental BOLT12 with LNDK
 
@@ -178,7 +182,7 @@ it creates a real invoice on the configured node.
 - **certificate hostname mismatch:** regenerate/configure LND's certificate for the exact hostname/IP; never disable verification.
 - **connection refused:** confirm LND port 8080, routing, firewall and shared LAN.
 - **macaroon permission denied:** bake the limited credential again with the three documented permissions.
-- **node not synced:** wait for the public sync flags from `/v1/node` to become true.
+- **node not synced:** use a merchant API key to inspect sync flags from `/v1/node`.
 - **invoice creation failed:** inspect redacted structured logs, limits, LND status and permissions.
 - **invoice expired:** create a fresh checkout; expired invoices are never confirmed.
 - **SSE disconnected:** the widget displays interruption and switches to authenticated polling.

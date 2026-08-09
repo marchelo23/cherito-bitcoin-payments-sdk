@@ -1,57 +1,28 @@
 import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
-import dns from 'node:dns/promises'
 import type { TenantRepository } from '../persistence/tenant-repository.js'
 import type { WebhookRepository, WebhookDelivery } from '../persistence/webhook-repository.js'
 import { NOOP_SAFE_LOGGER, safeLog, type SafeLogger } from '../logging/safe-logger.js'
+import { WebhookTransport } from './webhook-transport.js'
 
 /** Maximum delivery attempts before a webhook is marked permanently failed */
 const MAX_ATTEMPTS = 7
 /** Exponential backoff delays in milliseconds */
 const BACKOFF_DELAYS_MS = [1_000, 5_000, 15_000, 60_000, 300_000, 900_000, 3_600_000]
 
-/**
- * Validates a URL to prevent Server-Side Request Forgery (SSRF).
- * Blocks localhost, private network IPs, and metadata server IPs.
- */
-async function validateWebhookUrl(urlString: string): Promise<void> {
-  const url = new URL(urlString)
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-    throw new Error('Invalid protocol: only http and https are allowed')
-  }
-
-  // If the hostname is already an IP address, check it. Otherwise resolve it.
-  const isIp = /^\d+\.\d+\.\d+\.\d+$/.test(url.hostname)
-  const addresses = isIp ? [url.hostname] : await dns.resolve(url.hostname).catch(() => [])
-  
-  for (const address of addresses) {
-    if (isPrivateIP(address)) {
-      throw new Error('SSRF blocked: URL resolves to a private or reserved IP address')
-    }
-  }
-}
-
-function isPrivateIP(ip: string): boolean {
-  if (ip === '127.0.0.1' && process.env.NODE_ENV === 'test') return false
-  // Very basic block list for SSRF. Note: This should ideally include IPv6 blocks too.
-  const parts = ip.split('.').map((p) => parseInt(p, 10))
-  if (parts.length !== 4) return false
-  return (
-    parts[0] === 127 || // localhost
-    parts[0] === 10 || // private A
-    (parts[0] === 172 && parts[1]! >= 16 && parts[1]! <= 31) || // private B
-    (parts[0] === 192 && parts[1] === 168) || // private C
-    (parts[0] === 169 && parts[1] === 254) // link-local (metadata servers)
-  )
-}
-
 export class WebhookService {
   private deliveryTimer: NodeJS.Timeout | undefined
+  private lastSignatureTimestamp = 0
 
   constructor(
     private readonly webhookRepo: WebhookRepository,
     private readonly tenantRepo: TenantRepository,
     private readonly logger: SafeLogger = NOOP_SAFE_LOGGER,
+    private readonly transport: WebhookTransport = new WebhookTransport(),
   ) {}
+
+  async validateEndpoint(url: string): Promise<void> {
+    await this.transport.validate(url)
+  }
 
   /**
    * Minimal Payment Intent outbox integration. Configuration management stays
@@ -111,9 +82,7 @@ export class WebhookService {
     }
 
     try {
-      await validateWebhookUrl(tenant.webhookUrl)
-
-      const timestamp = Math.floor(Date.now() / 1000)
+      const timestamp = this.nextSignatureTimestamp()
       
       // Try the current secret first
       const secret = tenant.webhookSecret
@@ -125,28 +94,13 @@ export class WebhookService {
       const signature = this.sign(secret, timestamp, event.payload)
       const headerValue = `t=${timestamp},v1=${signature}`
 
-      const controller = new AbortController()
-      const timeoutId = setTimeout(() => controller.abort(), 10000)
-
-      const response = await fetch(tenant.webhookUrl, {
-        method: 'POST',
-        headers: {
+      const response = await this.transport.deliver(tenant.webhookUrl, event.payload, {
           'content-type': 'application/json',
           'cherito-signature': headerValue,
           'x-cherito-event-id': event.id,
           'x-cherito-delivery-id': delivery.id,
           'user-agent': 'Cherito-Webhook/1.0',
-        },
-        body: event.payload,
-        signal: controller.signal,
-        redirect: 'error', // Prevent redirect chaining / SSRF
       })
-      clearTimeout(timeoutId)
-
-      // Ensure we drain the response body to avoid memory leaks
-      if (response.body) {
-         void response.text().catch(() => {})
-      }
 
       if (response.ok) {
         this.webhookRepo.markDelivered(delivery.tenantId, delivery.id)
@@ -170,7 +124,9 @@ export class WebhookService {
    */
   async replayEvent(tenantId: string, eventId: string): Promise<void> {
     const event = this.webhookRepo.event(tenantId, eventId)
-    if (!event) throw new Error('Event not found')
+    if (!event) {
+      throw Object.assign(new Error('Event not found'), { statusCode: 404, code: 'NOT_FOUND' })
+    }
     
     const now = new Date().toISOString()
     const delivery: WebhookDelivery = {
@@ -189,6 +145,38 @@ export class WebhookService {
     await this.flush()
   }
 
+  async sendTestEvent(tenantId: string): Promise<void> {
+    const tenant = this.tenantRepo.tenant(tenantId)
+    if (!tenant?.webhookUrl || !tenant.webhookSecret) {
+      throw Object.assign(new Error('Webhook is not configured'), {
+        statusCode: 409,
+        code: 'WEBHOOK_NOT_CONFIGURED',
+      })
+    }
+    const timestamp = this.nextSignatureTimestamp()
+    const eventId = `we_test_${randomUUID()}`
+    const payload = JSON.stringify({ id: eventId, type: 'webhook.test', createdAt: new Date().toISOString() })
+    const signature = this.sign(tenant.webhookSecret, timestamp, payload)
+    const response = await this.transport.deliver(tenant.webhookUrl, payload, {
+      'content-type': 'application/json',
+      'cherito-signature': `t=${timestamp},v1=${signature}`,
+      'x-cherito-event-id': eventId,
+      'x-cherito-delivery-id': `wd_test_${randomUUID()}`,
+      'user-agent': 'Cherito-Webhook/1.0',
+    }).catch(() => {
+      throw Object.assign(new Error('Webhook test delivery failed'), {
+        statusCode: 502,
+        code: 'WEBHOOK_DELIVERY_FAILED',
+      })
+    })
+    if (!response.ok) {
+      throw Object.assign(new Error('Webhook test delivery failed'), {
+        statusCode: 502,
+        code: 'WEBHOOK_DELIVERY_FAILED',
+      })
+    }
+  }
+
   /** Start a background retry loop that runs every 30 seconds */
   startRetryLoop(): () => void {
     const timer = setInterval(() => void this.flush(), 30_000)
@@ -203,7 +191,7 @@ export class WebhookService {
   static verify(
     secret: string,
     signatureHeader: string,
-    body: string,
+    body: string | Buffer,
     toleranceSeconds = 300,
   ): boolean {
     const parts = signatureHeader.split(',')
@@ -214,10 +202,14 @@ export class WebhookService {
       else if (part.startsWith('v1=')) v1 = part.slice(3)
     }
 
-    if (!t || !v1) return false
+    if (!t || !/^[a-f0-9]{64}$/i.test(v1)) return false
     if (Math.abs(Date.now() / 1000 - t) > toleranceSeconds) return false
 
-    const expected = createHmac('sha256', secret).update(`${t}.${body}`).digest('hex')
+    const expected = createHmac('sha256', secret)
+      .update(String(t))
+      .update('.')
+      .update(body)
+      .digest('hex')
     
     const a = Buffer.from(expected)
     const b = Buffer.from(v1)
@@ -226,7 +218,17 @@ export class WebhookService {
   }
 
   private sign(secret: string, timestamp: number, body: string): string {
-    return createHmac('sha256', secret).update(`${timestamp}.${body}`).digest('hex')
+    return createHmac('sha256', secret)
+      .update(String(timestamp))
+      .update('.')
+      .update(body)
+      .digest('hex')
+  }
+
+  private nextSignatureTimestamp(): number {
+    const current = Math.floor(Date.now() / 1_000)
+    this.lastSignatureTimestamp = Math.max(current, this.lastSignatureTimestamp + 1)
+    return this.lastSignatureTimestamp
   }
 
   private scheduleRetry(delivery: WebhookDelivery): void {

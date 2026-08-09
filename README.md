@@ -27,11 +27,11 @@ backup, restore, and provider-reconciliation procedures.
 ## Install and develop
 
 ```bash
-npm install
+pnpm install
 cp .env.example .env
-npm run build
+pnpm run build
 set -a; source .env; set +a
-npm run dev
+pnpm run dev
 ```
 
 Set the frontend origin in `ALLOWED_ORIGINS`. Set `DATABASE_URL` to a writable,
@@ -107,7 +107,7 @@ persistent SQLite volume, healthcheck, restart policy and resource limits.
 ```bash
 curl http://localhost:3100/health
 curl http://localhost:3100/v1/capabilities
-curl http://localhost:3100/v1/node
+curl http://localhost:3100/v1/node -H 'Authorization: Bearer MERCHANT_API_KEY'
 curl -X POST http://localhost:3100/v1/checkout-sessions \
   -H 'Content-Type: application/json' \
   -H "Idempotency-Key: $(uuidgen | tr '[:upper:]' '[:lower:]')" \
@@ -121,27 +121,35 @@ curl -N http://localhost:3100/v1/checkout-sessions/chk_ID/events \
 The order changes to confirmed exactly once only after LND reports `SETTLED`.
 `ACCEPTED` maps to “Payment detected” but never confirms an order.
 
-## Widget integration
+## Payment Links and widget integration
 
 Build and serve `packages/cherito-checkout-widget/dist/index.js` from your own site:
 
 ```html
 <script type="module" src="/vendor/cherito-checkout-widget/index.js"></script>
 <cherito-bitcoin-checkout
+  mode="payment-link"
   api-url="https://payments.cherito.coffee"
-  product-id="cherito-coffee-001">
+  payment-link-slug="pl_REPLACE_WITH_PUBLIC_SLUG">
 </cherito-bitcoin-checkout>
 ```
 
+Each Payment Link invocation creates a new canonical Payment Intent and BOLT11.
 The QR is generated locally. The widget copies either the raw BOLT11 or
-`lightning:<invoice>`, authenticates its event stream, falls back to polling, and
-dispatches:
+`lightning:<invoice>`, authenticates its event stream with the scoped client
+capability, falls back to polling, and dispatches:
 
 ```js
-window.addEventListener('cherito:payment-settled', ({ detail }) => {
-  showOrderConfirmation(detail.orderId)
-})
+document.querySelector('cherito-bitcoin-checkout')
+  .addEventListener('cherito:payment-settled', ({ detail }) => {
+    showInformationalConfirmation(detail.paymentIntentId)
+  })
 ```
+
+This browser event is informational, never fulfillment authorization. A merchant
+backend must verify the Payment Intent through its authenticated API or a signed,
+provider-authoritative webhook. See [Payment Links and widget](docs/payment-links-and-widget.md)
+and [API abuse controls](docs/api-abuse-controls.md).
 
 Do not send payment hashes, invoices, node data, or status tokens to analytics.
 See [Logging, privacy, and retention](docs/logging-and-privacy.md) for the exact log
@@ -166,10 +174,10 @@ capabilities or disable-offer RPC, so neither is fabricated.
 ## Tests and optional regtest
 
 ```bash
-npm run lint
-npm run typecheck
-npm test
-npm run build
+pnpm run lint
+pnpm run typecheck
+pnpm run test
+pnpm run build
 ```
 
 For integration, configure `.env` against regtest, start the gateway, create a

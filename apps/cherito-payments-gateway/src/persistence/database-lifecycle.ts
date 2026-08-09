@@ -17,7 +17,7 @@ import {
   hashPaymentIntentClientSecret,
 } from '../security/payment-intent-client-capability.js'
 
-export const LATEST_DATABASE_SCHEMA_VERSION = 5
+export const LATEST_DATABASE_SCHEMA_VERSION = 6
 export const DATABASE_BACKUP_FORMAT_VERSION = 1
 
 const LEGACY_TENANT_ID = 'legacy'
@@ -169,6 +169,7 @@ function hasDurableData(db: DatabaseSync): boolean {
     'merchant_api_keys',
     'pricing_rules',
     'payment_intents',
+    'payment_links',
     'webhook_events',
     'webhook_deliveries',
   ].some((table) => rowCount(db, table) > 0)
@@ -789,6 +790,92 @@ function migrateLegacyPayments(db: DatabaseSync, context: MigrationContext): voi
   }
 }
 
+function createPaymentLinksAndAbuseControls(db: DatabaseSync): void {
+  db.exec(`
+    CREATE TABLE payment_links (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL,
+      slug TEXT NOT NULL UNIQUE,
+      mode TEXT NOT NULL CHECK (mode IN ('fixed','open_amount','donation')),
+      pricing_rule_id TEXT,
+      min_amount_sats TEXT,
+      max_amount_sats TEXT,
+      title TEXT NOT NULL,
+      description TEXT,
+      expires_at TEXT,
+      max_uses INTEGER CHECK (max_uses IS NULL OR max_uses > 0),
+      use_count INTEGER NOT NULL DEFAULT 0 CHECK (use_count >= 0),
+      reserved_uses INTEGER NOT NULL DEFAULT 0 CHECK (reserved_uses >= 0),
+      active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+      indexable INTEGER NOT NULL DEFAULT 0 CHECK (indexable IN (0, 1)),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(tenant_id, id),
+      CHECK (
+        (mode='fixed' AND pricing_rule_id IS NOT NULL
+          AND min_amount_sats IS NULL AND max_amount_sats IS NULL)
+        OR
+        (mode IN ('open_amount','donation') AND pricing_rule_id IS NULL
+          AND min_amount_sats IS NOT NULL AND max_amount_sats IS NOT NULL)
+      ),
+      CHECK (max_uses IS NULL OR use_count + reserved_uses <= max_uses),
+      FOREIGN KEY(tenant_id) REFERENCES tenants(id),
+      FOREIGN KEY(tenant_id, pricing_rule_id) REFERENCES pricing_rules(tenant_id, id)
+    );
+
+    CREATE TABLE payment_link_use_reservations (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL,
+      payment_link_id TEXT NOT NULL,
+      payment_intent_id TEXT NOT NULL UNIQUE,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(tenant_id, payment_link_id) REFERENCES payment_links(tenant_id, id)
+    );
+
+    CREATE TABLE merchant_action_idempotency (
+      tenant_id TEXT NOT NULL,
+      route TEXT NOT NULL,
+      idempotency_key TEXT NOT NULL,
+      payload_hash TEXT NOT NULL,
+      resource_id TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY(tenant_id, route, idempotency_key),
+      FOREIGN KEY(tenant_id) REFERENCES tenants(id)
+    );
+
+    CREATE INDEX idx_payment_links_tenant_created
+      ON payment_links(tenant_id, created_at DESC, id DESC);
+    CREATE INDEX idx_payment_links_public
+      ON payment_links(slug, active, expires_at);
+    CREATE INDEX idx_payment_link_reservations_link
+      ON payment_link_use_reservations(tenant_id, payment_link_id);
+    CREATE INDEX idx_merchant_action_idempotency_created
+      ON merchant_action_idempotency(created_at);
+
+    CREATE TRIGGER payment_intents_payment_link_tenant_insert
+    BEFORE INSERT ON payment_intents
+    WHEN NEW.payment_link_id IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM payment_links
+        WHERE tenant_id=NEW.tenant_id AND id=NEW.payment_link_id
+      )
+    BEGIN
+      SELECT RAISE(ABORT, 'payment_intent_payment_link_tenant_mismatch');
+    END;
+
+    CREATE TRIGGER payment_intents_payment_link_tenant_update
+    BEFORE UPDATE OF tenant_id, payment_link_id ON payment_intents
+    WHEN NEW.payment_link_id IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM payment_links
+        WHERE tenant_id=NEW.tenant_id AND id=NEW.payment_link_id
+      )
+    BEGIN
+      SELECT RAISE(ABORT, 'payment_intent_payment_link_tenant_mismatch');
+    END;
+  `)
+}
+
 export const DATABASE_MIGRATIONS: readonly DatabaseMigration[] = [
   { version: 1, name: 'tenant foundation', up: createTenantFoundation },
   { version: 2, name: 'legacy checkout and webhook outbox foundation', up: createLegacyAndOutboxFoundation },
@@ -800,6 +887,7 @@ export const DATABASE_MIGRATIONS: readonly DatabaseMigration[] = [
   },
   { version: 4, name: 'tenant ownership and relational hardening', destructive: true, up: hardenTenantOwnership },
   { version: 5, name: 'legacy checkout forward migration', up: migrateLegacyPayments },
+  { version: 6, name: 'reusable Payment Links and merchant action idempotency', up: createPaymentLinksAndAbuseControls },
 ] as const
 
 export function applyDatabaseMigrations(

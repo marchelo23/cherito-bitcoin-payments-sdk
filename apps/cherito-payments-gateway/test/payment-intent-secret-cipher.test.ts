@@ -147,7 +147,7 @@ test('legacy plaintext rows migrate transactionally and their SQLite pages are s
     inspected.close()
     assert.equal(columns.some(({ name }) => name === 'intent_secret'), false)
     assert.deepEqual(versions.map(({ version }) => version), [1, 2, 3])
-    assert.equal(schemaVersion.version, 5)
+    assert.equal(schemaVersion.version, 6)
     assert.equal(readFileSync(databasePath).includes(Buffer.from(plaintext, 'utf8')), false)
   } finally {
     rmSync(directory, { recursive: true, force: true })

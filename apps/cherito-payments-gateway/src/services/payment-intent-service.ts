@@ -80,6 +80,10 @@ export interface CreatePaymentIntentInput {
   description?: string
   metadata?: Record<string, unknown>
   idempotencyKey?: string
+  /** Internal-only preallocated ID used by the Payment Link reservation flow. */
+  intentId?: string
+  /** Internal-only reservation committed atomically with the Payment Intent. */
+  paymentLinkReservationId?: string
 }
 
 export interface PaymentIntentMerchantView {
@@ -221,6 +225,16 @@ export class PaymentIntentService {
   }
 
   async create(input: CreatePaymentIntentInput): Promise<PaymentIntentCreateResponse> {
+    return this.withTenantCreationLock(input.tenantId, () => this.createLocked(input))
+  }
+
+  async createForPaymentLink(
+    input: CreatePaymentIntentInput & {
+      paymentLinkId: string
+      intentId: string
+      paymentLinkReservationId: string
+    },
+  ): Promise<PaymentIntentCreateResponse> {
     return this.withTenantCreationLock(input.tenantId, () => this.createLocked(input))
   }
 
@@ -379,7 +393,7 @@ export class PaymentIntentService {
     const pricing = this.resolvePricing(input, quantity)
     this.validateAmount(pricing.amountSats)
 
-    const intentId = `pi_${randomUUID()}`
+    const intentId = input.intentId ?? `pi_${randomUUID()}`
     const description = descriptionInput ?? pricing.description ?? `Payment ${intentId}`
     assertUtf8Bound(description, MAX_DESCRIPTION_BYTES, 'description')
 
@@ -425,7 +439,11 @@ export class PaymentIntentService {
       createdAt: now,
       updatedAt: now,
     }
-    this.repo.createPaymentIntent(intent)
+    if (input.paymentLinkReservationId) {
+      this.repo.createPaymentIntentForReservedLink(intent, input.paymentLinkReservationId)
+    } else {
+      this.repo.createPaymentIntent(intent)
+    }
     void this.ensureWatcher(intent)
     return { ...this.toMerchant(intent), clientSecret }
   }

@@ -178,7 +178,7 @@ describe('versioned SQLite migrations', () => {
       assert.deepEqual(
         (db.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as Array<{ version: number }>)
           .map(({ version }) => version),
-        [1, 2, 3, 4, 5],
+        [1, 2, 3, 4, 5, 6],
       )
       assert.equal((db.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number }).foreign_keys, 1)
       assert.equal((db.prepare('PRAGMA journal_mode').get() as { journal_mode: string }).journal_mode, 'wal')
@@ -199,7 +199,7 @@ describe('versioned SQLite migrations', () => {
       backupDirectory: backups,
       now: () => new Date('2026-01-02T03:04:05.000Z'),
     })
-    assert.equal(currentSchemaVersion(db), 5)
+    assert.equal(currentSchemaVersion(db), 6)
     assert.equal((db.prepare('SELECT COUNT(*) count FROM orders').get() as { count: number }).count, 2)
     assert.equal((db.prepare('SELECT COUNT(*) count FROM lightning_invoices').get() as { count: number }).count, 2)
     assert.equal((db.prepare('SELECT COUNT(*) count FROM checkout_sessions').get() as { count: number }).count, 2)
@@ -291,17 +291,17 @@ describe('versioned SQLite migrations', () => {
       intentSecretCipher: cipher(),
       backupDirectory: join(directory, 'valid-backups'),
     })
-    assert.equal(currentSchemaVersion(recovered), 5)
+    assert.equal(currentSchemaVersion(recovered), 6)
     assert.equal((recovered.prepare('SELECT COUNT(*) count FROM orders').get() as { count: number }).count, 2)
     recovered.close()
   })
 
-  test('future schemas and unmerged Payment Link prototypes fail closed', () => {
+  test('future schemas and unversioned Payment Link prototypes fail closed', () => {
     const futurePath = join(temporaryDirectory(), 'future.sqlite')
     const future = new DatabaseSync(futurePath)
     future.exec(`
       CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT, applied_at TEXT NOT NULL);
-      INSERT INTO schema_migrations VALUES (6, 'future', '2026-01-01T00:00:00.000Z');
+      INSERT INTO schema_migrations VALUES (7, 'future', '2026-01-01T00:00:00.000Z');
     `)
     future.close()
     assert.throws(
@@ -452,7 +452,7 @@ describe('SQLite-safe backup, restore, and provider recovery', () => {
 
   test('backup API produces a consistent WAL-aware database plus validated metadata', async () => {
     const { backupPath, backup } = await preparedBackup()
-    assert.equal(backup.metadata.schemaVersion, 5)
+    assert.equal(backup.metadata.schemaVersion, 6)
     assert.equal(backup.metadata.applicationVersion, 'test-version')
     assert.match(backup.metadata.sha256!, /^[a-f0-9]{64}$/)
     assert.equal(JSON.parse(readFileSync(`${backupPath}.json`, 'utf8')).databaseBytes, backup.metadata.databaseBytes)
@@ -491,7 +491,7 @@ describe('SQLite-safe backup, restore, and provider recovery', () => {
       destinationDatabaseUrl: `file:${destination}`,
       intentSecretCipher: cipher(),
     })
-    assert.deepEqual(restored, { schemaVersion: 5, requiresProviderReconciliation: true })
+    assert.deepEqual(restored, { schemaVersion: 6, requiresProviderReconciliation: true })
     await assert.rejects(
       () => restoreDatabaseBackup({
         backupPath: first.backupPath,

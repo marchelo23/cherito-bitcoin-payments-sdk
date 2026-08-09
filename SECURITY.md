@@ -262,8 +262,34 @@ welcome, and still get triaged.
 
 ---
 
-## 9. Related documents
+## 9. Incident response
 
+The sections above cover how a vulnerability reaches us. What maintainers and
+operators do once something has actually gone wrong — a leaked credential, a stolen
+database, a suspected false settlement, a compromised release — is documented
+separately in **[`docs/incident-response.md`](docs/incident-response.md)**.
+
+It contains runbooks for each of those scenarios, the severity and escalation
+ladder, an evidence-preservation checklist, incident roles, merchant notification
+criteria, the emergency release procedure, and a worked credential-compromise
+tabletop exercise.
+
+Two things worth knowing before you need it:
+
+- **A Cherito compromise is a payment-integrity and data incident, not a wallet
+  incident.** Cherito never holds seed phrases and never signs outgoing payments,
+  and the gateway refuses to start if `ADMIN_MACAROON`, `SEED`, `XPRV` or
+  `PRIVATE_KEY` are present in its environment. Runbook 1 covers the exception —
+  a node credential that was provisioned with more permission than the policy allows.
+- **Several containment actions are not yet automated.** Key revocation, tenant
+  disable, webhook rotation and event replay exist only as in-process service
+  methods with no operator-facing route. The document marks every such gap as an
+  `Implementation dependency` rather than implying the capability exists.
+
+## 10. Related documents
+
+- [`docs/incident-response.md`](docs/incident-response.md) — incident runbooks,
+  severity ladder, evidence handling, emergency release and tabletop exercise.
 - [`docs/threat-model.md`](docs/threat-model.md) — trust boundaries, attacker
   model, and the security work outstanding before a production recommendation.
 - [`docs/database-recovery.md`](docs/database-recovery.md) — database backup and

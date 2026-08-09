@@ -2,25 +2,37 @@ process.env.NODE_ENV = 'test'
 import { test, describe, afterEach, mock } from 'node:test'
 import assert from 'node:assert/strict'
 import { randomUUID, createHmac } from 'node:crypto'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { WebhookRepository } from '../src/persistence/webhook-repository.js'
 import { TenantRepository } from '../src/persistence/tenant-repository.js'
 import { WebhookService } from '../src/services/webhook-service.js'
 import { TenantService } from '../src/services/tenant-service.js'
 import { ApiKeyService } from '../src/services/api-key-service.js'
 
+const setupCleanups: Array<() => void> = []
+
 function setup() {
-  const dbFile = `file::memory:?cache=shared&uri=${randomUUID()}`
+  const directory = mkdtempSync(join(tmpdir(), 'cherito-webhook-test-'))
+  const dbFile = `file:${join(directory, 'webhooks.sqlite')}`
   const webhookRepo = new WebhookRepository(dbFile)
   const tenantRepo = new TenantRepository(dbFile)
   const webhookService = new WebhookService(webhookRepo, tenantRepo)
   const apiKeyService = new ApiKeyService(tenantRepo as never)
   const tenantService = new TenantService(tenantRepo, apiKeyService)
+  setupCleanups.push(() => {
+    webhookRepo.close()
+    tenantRepo.close()
+    rmSync(directory, { recursive: true, force: true })
+  })
   return { webhookRepo, webhookService, tenantService }
 }
 
 describe('WebhookService', () => {
   afterEach(() => {
     mock.restoreAll()
+    while (setupCleanups.length > 0) setupCleanups.pop()!()
   })
 
   test('SSRF-safe: blocks localhost, private IP, and metadata server', async () => {

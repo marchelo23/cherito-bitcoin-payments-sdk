@@ -87,6 +87,60 @@ export class WebhookRepository {
       )
   }
 
+  /**
+   * Atomically persists one logical event and its first delivery. The unique
+   * event constraint makes duplicate settlement callbacks a no-op.
+   */
+  createEventAndDeliveryIfAbsent(
+    event: WebhookEvent,
+    delivery: WebhookDelivery,
+  ): boolean {
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const inserted = this.db
+        .prepare(
+          `INSERT OR IGNORE INTO webhook_events
+           (id, tenant_id, payment_intent_id, type, payload, created_at)
+           VALUES (?,?,?,?,?,?)`,
+        )
+        .run(
+          event.id,
+          event.tenantId,
+          event.paymentIntentId,
+          event.type,
+          event.payload,
+          event.createdAt,
+        ) as { changes: number }
+      if (inserted.changes === 0) {
+        this.db.exec('ROLLBACK')
+        return false
+      }
+      this.db
+        .prepare(
+          `INSERT INTO webhook_deliveries
+           (id, event_id, tenant_id, status, attempt_count, last_attempt_at,
+            next_attempt_at, delivered_at, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?)`,
+        )
+        .run(
+          delivery.id,
+          delivery.eventId,
+          delivery.tenantId,
+          delivery.status,
+          delivery.attemptCount,
+          delivery.lastAttemptAt,
+          delivery.nextAttemptAt,
+          delivery.deliveredAt,
+          delivery.createdAt,
+        )
+      this.db.exec('COMMIT')
+      return true
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
   event(id: string): WebhookEvent | undefined {
     const row = this.db.prepare('SELECT id, tenant_id tenantId, payment_intent_id paymentIntentId, type, payload, created_at createdAt FROM webhook_events WHERE id=?').get(id) as Record<string, unknown> | undefined
     return row ? (row as unknown as WebhookEvent) : undefined
@@ -125,5 +179,9 @@ export class WebhookRepository {
     this.db
       .prepare("UPDATE webhook_deliveries SET status='permanently_failed', last_attempt_at=?, next_attempt_at=NULL, attempt_count = attempt_count + 1 WHERE id=?")
       .run(new Date().toISOString(), id)
+  }
+
+  close(): void {
+    this.db.close()
   }
 }

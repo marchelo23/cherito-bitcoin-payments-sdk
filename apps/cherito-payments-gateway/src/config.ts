@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { PaymentIntentSecretCipher } from './security/payment-intent-secret-cipher.js'
 const schema = z.object({
   NODE_ENV: z
     .enum(["development", "test", "production"])
@@ -26,11 +27,18 @@ const schema = z.object({
     .default(900),
   RATE_LIMIT_CREATE_INVOICE: z.coerce.number().int().positive().default(10),
   DATABASE_URL: z.string().default("file:./data/cherito-payments.db"),
+  CHERITO_INTENT_SECRET_KEY: z.string().min(1),
+  CHERITO_INTENT_SECRET_PREVIOUS_KEYS: z.string().default(""),
   LOG_LEVEL: z
     .enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"])
     .default("info"),
   IDEMPOTENCY_TTL_SECONDS: z.coerce.number().int().positive().default(86400),
-  BOOTSTRAP_TENANT_NAME: z.string().default("Default Merchant"),
+  PAYMENT_INTENT_RECOVERY_CONCURRENCY: z.coerce.number().int().min(1).max(50).default(5),
+  PAYMENT_INTENT_RECONCILIATION_INTERVAL_MS: z.coerce.number().int().min(1_000).default(60_000),
+  PAYMENT_INTENT_WATCH_RETRY_BASE_MS: z.coerce.number().int().min(100).default(1_000),
+  PAYMENT_INTENT_WATCH_RETRY_MAX_MS: z.coerce.number().int().min(1_000).default(60_000),
+  SQLITE_BUSY_TIMEOUT_MS: z.coerce.number().int().min(0).max(60_000).default(5_000),
+  BOOTSTRAP_TENANT_NAME: z.string().min(2).max(80).default("Default Merchant"),
   BOOTSTRAP_KEY_PATH: z.string().optional(),
 });
 export type Config = z.infer<typeof schema>;
@@ -39,12 +47,19 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     if (env[name])
       throw new Error(`Unsafe configuration is forbidden: ${name}`);
   const c = schema.parse(env);
+  // Reject malformed or duplicate keys before opening or migrating SQLite.
+  new PaymentIntentSecretCipher(
+    c.CHERITO_INTENT_SECRET_KEY,
+    c.CHERITO_INTENT_SECRET_PREVIOUS_KEYS,
+  );
   if (!c.LND_TLS_CERT_PATH && !c.LND_TLS_CERT_BASE64)
     throw new Error("LND TLS credential is required");
   if (!c.LND_MACAROON_PATH && !c.LND_MACAROON_HEX)
     throw new Error("Limited invoice macaroon is required");
   if (c.MIN_INVOICE_SATS > c.MAX_INVOICE_SATS)
     throw new Error("Invoice limits are inverted");
+  if (c.PAYMENT_INTENT_WATCH_RETRY_BASE_MS > c.PAYMENT_INTENT_WATCH_RETRY_MAX_MS)
+    throw new Error("Payment Intent watcher retry limits are inverted");
   if (
     c.BOLT12_PROVIDER === "lndk" &&
     (!c.LNDK_GRPC_URL || !c.LNDK_TLS_CERT_PATH || !c.LNDK_MACAROON_PATH)

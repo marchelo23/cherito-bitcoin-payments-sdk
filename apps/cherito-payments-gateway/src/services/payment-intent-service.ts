@@ -1,255 +1,428 @@
-import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
-import { invoiceStateToIntentStatus } from '@cherito/bitcoin-sdk'
-import type { LightningReceiveProvider, Bolt12ReceiveProvider } from '@cherito/bitcoin-sdk'
-import type { Config } from '../config.js'
+import {
+  createHash,
+  createHmac,
+  randomBytes,
+  randomUUID,
+  timingSafeEqual,
+} from 'node:crypto'
 import type {
-  Repository,
-  PaymentIntent,
-  PricingRule,
-} from '../persistence/repository.js'
-import type { WebhookService } from './webhook-service.js'
+  InvoiceState,
+  LightningInvoice,
+  LightningReceiveProvider,
+  PaymentIntentStatus,
+} from '@cherito/bitcoin-sdk'
+import type { Config } from '../config.js'
+import {
+  PAYMENT_INTENT_TERMINAL_STATUSES,
+  type PaymentIntent,
+  type PaymentIntentRepository,
+} from '../persistence/payment-intent-repository.js'
+import type { PricingRule } from '../persistence/tenant-repository.js'
 import type { TenantService } from './tenant-service.js'
 
-const sha256 = (v: string): string => createHash('sha256').update(v).digest('hex')
+const CLIENT_CAPABILITY_DOMAIN = 'cherito:payment-intent-client:v1'
+const CLIENT_CAPABILITY_HASH_DOMAIN = 'cherito:payment-intent-client-hash:v1'
+const IDEMPOTENCY_DOMAIN = 'cherito:payment-intent-idempotency:v1'
+const MAX_METADATA_BYTES = 4_096
+const MAX_DESCRIPTION_BYTES = 500
+const MAX_MERCHANT_ORDER_ID_BYTES = 200
+const MAX_IDEMPOTENCY_KEY_BYTES = 200
 
-/**
- * Derive a scoped browser capability token from the intent ID + a server secret.
- *
- * Design:
- *   clientSecret = "cs_" + HMAC-SHA256(intentSecret, intentId + ":" + tenantId)
- *
- * Where intentSecret = random 32-byte hex stored at intent creation.
- * The hash of this is stored in client_secret_hash.
- *
- * This means:
- * - The plaintext can be re-derived at any time from intentSecret + intentId
- * - The secret is never stored in plaintext in the DB
- * - Idempotent retries can return a usable clientSecret
- * - A lost response can be recovered without creating a second invoice
- */
-function deriveClientSecret(intentSecret: string, intentId: string, tenantId: string): string {
-  const hmac = createHmac('sha256', intentSecret)
-    .update(`${intentId}:${tenantId}`)
-    .digest('base64url')
-  return `cs_${hmac}`
+const TERMINAL_STATUSES = new Set<PaymentIntentStatus>(PAYMENT_INTENT_TERMINAL_STATUSES)
+const ALLOWED_TRANSITIONS: Readonly<Record<PaymentIntentStatus, ReadonlySet<PaymentIntentStatus>>> = {
+  requires_payment: new Set(['processing', 'succeeded', 'expired', 'failed', 'canceled']),
+  processing: new Set(['succeeded', 'expired', 'failed', 'canceled']),
+  succeeded: new Set(),
+  expired: new Set(),
+  failed: new Set(),
+  canceled: new Set(),
 }
 
-/**
- * Public projection of a PaymentIntent returned to the merchant backend.
- * Never contains the merchant API key or internal node credentials.
- */
-export interface PaymentIntentResponse {
+interface WatcherEntry {
+  cleanup?: () => Promise<void>
+  stopRequested: boolean
+}
+
+export interface PaymentIntentEventSink {
+  enqueuePaymentIntentEvent(
+    tenantId: string,
+    paymentIntentId: string,
+    type: string,
+    payload: string,
+  ): Promise<void> | void
+}
+
+export interface PaymentIntentServiceOptions {
+  recoveryConcurrency?: number
+  reconciliationIntervalMs?: number
+  watcherRetryBaseMs?: number
+  watcherRetryMaxMs?: number
+  now?: () => number
+  random?: () => number
+  logger?: Pick<Console, 'error'>
+}
+
+export interface CreatePaymentIntentInput {
+  tenantId: string
+  amountSats?: bigint
+  productId?: string
+  pricingRuleId?: string
+  paymentLinkId?: string
+  quantity?: number
+  merchantOrderId?: string
+  description?: string
+  metadata?: Record<string, unknown>
+  idempotencyKey?: string
+}
+
+export interface PaymentIntentMerchantView {
   id: string
   tenantId: string
   merchantOrderId: string | null
+  pricingRuleId: string | null
+  paymentLinkId: string | null
   amountSats: string
-  currency: 'sat'
+  currency: 'SAT'
   description: string
-  status: string
+  metadata: Record<string, unknown> | null
+  status: PaymentIntentStatus
   paymentRequest: string
   paymentHash: string
+  providerInvoiceId: string
   expiresAt: string
   settledAt: string | null
   createdAt: string
-  /**
-   * Scoped browser capability token. Present only at creation time and on
-   * idempotent retries (re-derived from stored intentSecret). Never empty.
-   */
+  updatedAt: string
+}
+
+export interface PaymentIntentCreateResponse extends PaymentIntentMerchantView {
   clientSecret: string
 }
 
-/**
- * Public (browser-safe) projection — never contains credentials.
- */
-export interface PaymentIntentPublic {
+export interface PaymentIntentClientView {
   id: string
   amountSats: string
-  currency: 'sat'
+  currency: 'SAT'
   description: string
-  status: string
+  status: PaymentIntentStatus
   paymentRequest: string
   expiresAt: string
+  settledAt: string | null
+  updatedAt: string
 }
 
-/**
- * Create input allowing either product-backed or backend-defined amounts.
- * A public browser must NEVER reach this service directly.
- */
-export interface CreatePaymentIntentInput {
-  tenantId: string
-  /**
-   * Optional merchant order ID (e.g. WooCommerce order ID).
-   * Unique per tenant. If supplied, a duplicate reuses the existing intent
-   * when combined with idempotencyKey.
-   */
-  merchantOrderId?: string
-  /**
-   * Optional product reference for catalog-backed intents.
-   * Required when amountSats is not provided.
-   */
-  productId?: string
-  quantity?: number
-  /**
-   * Explicit amount for backend-defined intents (e.g. WooCommerce).
-   * Bypasses catalog pricing. Required when productId is not provided.
-   */
-  amountSats?: bigint
-  description?: string
-  /** Bounded merchant metadata: max 4 KB serialized */
-  metadata?: Record<string, unknown>
-  idempotencyKey?: string
-  paymentLinkId?: string
-  pricingRuleId?: string
+function sha256(value: string): string {
+  return createHash('sha256').update(value).digest('hex')
 }
 
-/**
- * PaymentIntentService manages the full lifecycle of a Payment Intent:
- * create → watch (subscribe to provider) → settle → webhook
- *
- * Security invariants:
- * - Amount is always server-controlled
- * - Browser clients receive only a scoped clientSecret, never the merchant API key
- * - Settlement derives exclusively from provider callbacks
- * - All queries are scoped by tenantId — cross-tenant access is impossible
- * - Idempotent retries always return a usable clientSecret
- * - Terminal states are never reversed by stale events
- * - Duplicate watchers are prevented via a registry
- */
+function deriveClientSecret(intentSecret: string, intentId: string, tenantId: string): string {
+  if (!/^[a-f0-9]{64}$/.test(intentSecret)) {
+    throw new Error('Stored Payment Intent secret is invalid')
+  }
+  const digest = createHmac('sha256', Buffer.from(intentSecret, 'hex'))
+    .update(CLIENT_CAPABILITY_DOMAIN)
+    .update('\0')
+    .update(tenantId)
+    .update('\0')
+    .update(intentId)
+    .digest('base64url')
+  return `cs_v1_${digest}`
+}
+
+function hashClientSecret(clientSecret: string): string {
+  return sha256(`${CLIENT_CAPABILITY_HASH_DOMAIN}\0${clientSecret}`)
+}
+
+function normalizedString(value: string | undefined): string | undefined {
+  return value?.normalize('NFC')
+}
+
+function assertUtf8Bound(value: string, maxBytes: number, field: string): void {
+  if (Buffer.byteLength(value, 'utf8') > maxBytes) {
+    throw paymentIntentError(400, `${field.toUpperCase()}_TOO_LARGE`, `${field} is too large`)
+  }
+}
+
+function canonicalJson(value: unknown): string {
+  const seen = new WeakSet<object>()
+
+  const encode = (item: unknown): string => {
+    if (item === null) return 'null'
+    if (typeof item === 'string' || typeof item === 'boolean') return JSON.stringify(item)
+    if (typeof item === 'number') {
+      if (!Number.isFinite(item)) throw new Error('metadata contains a non-finite number')
+      return JSON.stringify(item)
+    }
+    if (Array.isArray(item)) return `[${item.map(encode).join(',')}]`
+    if (typeof item !== 'object') throw new Error('metadata must contain only JSON values')
+    if (seen.has(item)) throw new Error('metadata must not contain cycles')
+    const prototype = Object.getPrototypeOf(item)
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw new Error('metadata must contain only plain JSON objects')
+    }
+    seen.add(item)
+    const record = item as Record<string, unknown>
+    const result = `{${Object.keys(record)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${encode(record[key])}`)
+      .join(',')}}`
+    seen.delete(item)
+    return result
+  }
+
+  return encode(value)
+}
+
+function paymentIntentError(statusCode: number, code: string, message: string): Error {
+  return Object.assign(new Error(message), { statusCode, code })
+}
+
+function providerStatus(state: InvoiceState): PaymentIntentStatus | undefined {
+  switch (state) {
+    case 'pending':
+      return 'requires_payment'
+    case 'accepted':
+      return 'processing'
+    case 'settled':
+      return 'succeeded'
+    case 'expired':
+      return 'expired'
+    case 'canceled':
+      return 'canceled'
+    case 'unknown':
+      return undefined
+  }
+}
+
 export class PaymentIntentService {
-  private readonly listeners = new Map<string, Set<(s: PaymentIntent) => void>>()
-  /** Active watcher cleanup functions, keyed by paymentHash to prevent duplicates */
-  private readonly watchers = new Map<string, () => Promise<void>>()
-
-  // Concurrency limiter for recovery
-  private readonly RECOVERY_CONCURRENCY = 5
+  private readonly listeners = new Map<string, Set<(intent: PaymentIntent) => void>>()
+  private readonly watchers = new Map<string, WatcherEntry>()
+  private readonly watcherRetryTimers = new Map<string, NodeJS.Timeout>()
+  private readonly watcherRetryAttempts = new Map<string, number>()
+  private readonly creationLocks = new Map<string, Promise<void>>()
+  private readonly recoveryConcurrency: number
+  private readonly reconciliationIntervalMs: number
+  private readonly watcherRetryBaseMs: number
+  private readonly watcherRetryMaxMs: number
+  private readonly now: () => number
+  private readonly random: () => number
+  private readonly logger: Pick<Console, 'error'>
+  private reconciliationTimer: NodeJS.Timeout | undefined
+  private reconciliationInFlight: Promise<void> | undefined
+  private shuttingDown = false
 
   constructor(
-    private readonly lnd: LightningReceiveProvider,
-    private readonly bolt12: Bolt12ReceiveProvider | undefined,
-    private readonly repo: Repository,
+    private readonly provider: LightningReceiveProvider,
+    private readonly repo: PaymentIntentRepository,
     private readonly config: Config,
-    private readonly tenantService?: TenantService,
-    private readonly webhookService?: WebhookService,
-  ) {}
+    private readonly tenantService: TenantService,
+    private readonly eventSink?: PaymentIntentEventSink,
+    options: PaymentIntentServiceOptions = {},
+  ) {
+    this.recoveryConcurrency = Math.max(1, Math.trunc(options.recoveryConcurrency ?? 5))
+    this.reconciliationIntervalMs = Math.max(1, options.reconciliationIntervalMs ?? 60_000)
+    this.watcherRetryBaseMs = Math.max(1, options.watcherRetryBaseMs ?? 1_000)
+    this.watcherRetryMaxMs = Math.max(
+      this.watcherRetryBaseMs,
+      options.watcherRetryMaxMs ?? 60_000,
+    )
+    this.now = options.now ?? Date.now
+    this.random = options.random ?? Math.random
+    this.logger = options.logger ?? console
+  }
 
-  // ---- Creation ------------------------------------------------------------
+  async create(input: CreatePaymentIntentInput): Promise<PaymentIntentCreateResponse> {
+    return this.withTenantCreationLock(input.tenantId, () => this.createLocked(input))
+  }
 
-  async create(input: CreatePaymentIntentInput): Promise<PaymentIntentResponse> {
-    const {
-      tenantId,
-      productId,
-      quantity = 1,
-      idempotencyKey,
-      paymentLinkId = null,
-      merchantOrderId = null,
-    } = input
+  getMerchantIntent(tenantId: string, intentId: string): PaymentIntentMerchantView | undefined {
+    const intent = this.repo.paymentIntent(tenantId, intentId)
+    return intent ? this.toMerchant(intent) : undefined
+  }
 
-    // --- Validate metadata size (max 4 KB serialized) -----------------------
-    if (input.metadata) {
-      const serialized = JSON.stringify(input.metadata)
-      if (serialized.length > 4096) {
-        throw Object.assign(
-          new Error('metadata exceeds 4 KB serialized limit'),
-          { statusCode: 400, code: 'METADATA_TOO_LARGE' },
-        )
+  authorizeClient(
+    tenantId: string,
+    intentId: string,
+    clientSecret: string,
+  ): PaymentIntent | undefined {
+    const intent = this.repo.paymentIntent(tenantId, intentId)
+    if (!intent) return undefined
+    const actual = Buffer.from(hashClientSecret(clientSecret), 'hex')
+    const expected = Buffer.from(intent.clientSecretHash, 'hex')
+    if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) return undefined
+    return intent
+  }
+
+  listen(intentId: string, callback: (intent: PaymentIntent) => void): () => void {
+    const listeners = this.listeners.get(intentId) ?? new Set()
+    listeners.add(callback)
+    this.listeners.set(intentId, listeners)
+    return () => {
+      listeners.delete(callback)
+      if (listeners.size === 0) this.listeners.delete(intentId)
+    }
+  }
+
+  async recoverPendingIntents(): Promise<void> {
+    await this.reconcile()
+  }
+
+  async reconcile(): Promise<void> {
+    if (this.shuttingDown) return
+    if (this.reconciliationInFlight) return this.reconciliationInFlight
+    this.reconciliationInFlight = this.reconcileNonTerminalIntents().finally(() => {
+      this.reconciliationInFlight = undefined
+    })
+    return this.reconciliationInFlight
+  }
+
+  startReconciliationLoop(intervalMs = this.reconciliationIntervalMs): () => void {
+    this.stopReconciliationLoop()
+    this.reconciliationTimer = setInterval(() => {
+      void this.reconcile().catch((error: unknown) => {
+        this.logger.error('Payment Intent reconciliation failed', error)
+      })
+    }, Math.max(1, intervalMs))
+    this.reconciliationTimer.unref?.()
+    return () => this.stopReconciliationLoop()
+  }
+
+  async shutdown(): Promise<void> {
+    if (this.shuttingDown) return
+    this.shuttingDown = true
+    this.stopReconciliationLoop()
+    for (const timer of this.watcherRetryTimers.values()) clearTimeout(timer)
+    this.watcherRetryTimers.clear()
+    this.watcherRetryAttempts.clear()
+    await this.reconciliationInFlight?.catch((error: unknown) => {
+      this.logger.error('Payment Intent reconciliation shutdown failed', error)
+    })
+    await Promise.allSettled([...this.watchers.keys()].map((hash) => this.stopWatcher(hash)))
+    this.listeners.clear()
+  }
+
+  toClient(intent: PaymentIntent): PaymentIntentClientView {
+    return {
+      id: intent.id,
+      amountSats: intent.amountSats,
+      currency: intent.currency,
+      description: intent.description,
+      status: intent.status,
+      paymentRequest: intent.paymentRequest,
+      expiresAt: intent.expiresAt,
+      settledAt: intent.settledAt,
+      updatedAt: intent.updatedAt,
+    }
+  }
+
+  private async createLocked(
+    input: CreatePaymentIntentInput,
+  ): Promise<PaymentIntentCreateResponse> {
+    const tenantId = input.tenantId
+
+    const merchantOrderId = normalizedString(input.merchantOrderId)
+    if (merchantOrderId !== undefined) {
+      if (merchantOrderId.length === 0) {
+        throw paymentIntentError(400, 'INVALID_MERCHANT_ORDER_ID', 'merchantOrderId is empty')
       }
+      assertUtf8Bound(merchantOrderId, MAX_MERCHANT_ORDER_ID_BYTES, 'merchantOrderId')
     }
 
-    // --- Validate tenant is active ------------------------------------------
-    if (this.tenantService) {
-      this.tenantService.assertActive(tenantId)
+    const descriptionInput = normalizedString(input.description)
+    if (descriptionInput !== undefined) {
+      assertUtf8Bound(descriptionInput, MAX_DESCRIPTION_BYTES, 'description')
     }
 
-    // --- Idempotency check --------------------------------------------------
-    const payloadHash = this.buildPayloadHash(input)
+    const metadata = input.metadata === undefined ? null : canonicalJson(input.metadata)
+    if (metadata !== null && Buffer.byteLength(metadata, 'utf8') > MAX_METADATA_BYTES) {
+      throw paymentIntentError(400, 'METADATA_TOO_LARGE', 'metadata exceeds 4096 bytes')
+    }
+
+    const idempotencyKey = normalizedString(input.idempotencyKey)
+    if (idempotencyKey !== undefined) {
+      if (idempotencyKey.length === 0) {
+        throw paymentIntentError(400, 'INVALID_IDEMPOTENCY_KEY', 'idempotencyKey is empty')
+      }
+      assertUtf8Bound(idempotencyKey, MAX_IDEMPOTENCY_KEY_BYTES, 'idempotencyKey')
+    }
+
+    const quantity = input.quantity ?? 1
+    if (!Number.isInteger(quantity) || quantity < 1 || quantity > 100) {
+      throw paymentIntentError(400, 'INVALID_QUANTITY', 'quantity is invalid')
+    }
+
+    const payloadHash = this.idempotencyPayloadHash({
+      productId: input.productId ?? null,
+      pricingRuleId: input.pricingRuleId ?? null,
+      paymentLinkId: input.paymentLinkId ?? null,
+      amountSats: input.amountSats,
+      quantity,
+      merchantOrderId: merchantOrderId ?? null,
+      description: descriptionInput ?? null,
+      metadata,
+    })
+
     if (idempotencyKey) {
       const existing = this.repo.paymentIntentByIdempotencyKey(tenantId, idempotencyKey)
       if (existing) {
         if (existing.idempotencyPayloadHash !== payloadHash) {
-          throw Object.assign(
-            new Error('Idempotency key payload conflict'),
-            { statusCode: 409, code: 'IDEMPOTENCY_CONFLICT' },
-          )
+          throw paymentIntentError(409, 'IDEMPOTENCY_CONFLICT', 'Idempotency key payload conflict')
         }
-        // Re-derive client secret from stored intentSecret — never empty on retry
-        const clientSecret = deriveClientSecret(
-          existing.intentSecret,
-          existing.id,
-          existing.tenantId,
+        return this.createResponse(existing)
+      }
+    }
+
+    // Existing idempotent results remain recoverable even if a tenant is later
+    // disabled. Only creation of a new provider invoice requires an active tenant.
+    this.tenantService.assertActive(tenantId)
+
+    if (merchantOrderId) {
+      const existingOrder = this.repo.paymentIntentByMerchantOrderId(tenantId, merchantOrderId)
+      if (existingOrder) {
+        throw paymentIntentError(
+          409,
+          'MERCHANT_ORDER_CONFLICT',
+          'merchantOrderId already belongs to another Payment Intent',
         )
-        return { ...this.toMerchantResponse(existing), clientSecret }
       }
     }
 
-    // --- Pricing (server-controlled) ----------------------------------------
-    let amountSats: bigint
-    let pricingRuleId: string | null = input.pricingRuleId ?? null
+    const pricing = this.resolvePricing(input, quantity)
+    this.validateAmount(pricing.amountSats)
 
-    if (input.amountSats !== undefined) {
-      // Backend-defined amount (e.g. WooCommerce order total)
-      amountSats = input.amountSats
-    } else if (productId) {
-      // Catalog-backed pricing
-      const rule: PricingRule | undefined = this.repo.pricingRule(tenantId, productId)
-      if (!rule?.active) {
-        throw Object.assign(new Error('Product unavailable'), { statusCode: 404, code: 'PRODUCT_NOT_FOUND' })
-      }
-      if (!Number.isInteger(quantity) || quantity < 1 || quantity > rule.maxQuantity) {
-        throw Object.assign(new Error('Quantity is invalid'), { statusCode: 400, code: 'INVALID_QUANTITY' })
-      }
-      amountSats = BigInt(rule.priceSats!) * BigInt(quantity)
-      pricingRuleId = rule.id
-    } else {
-      throw Object.assign(
-        new Error('Either productId or amountSats must be provided'),
-        { statusCode: 400, code: 'MISSING_AMOUNT' },
-      )
-    }
-
-    if (amountSats <= 0n) {
-      throw Object.assign(new Error('Amount must be positive'), { statusCode: 400, code: 'INVALID_AMOUNT' })
-    }
-    if (amountSats < this.config.MIN_INVOICE_SATS || amountSats > this.config.MAX_INVOICE_SATS) {
-      throw Object.assign(
-        new Error('Amount is outside merchant limits'),
-        { statusCode: 400, code: 'AMOUNT_OUT_OF_RANGE' },
-      )
-    }
-
-    // --- Create invoice with Lightning provider ----------------------------
     const intentId = `pi_${randomUUID()}`
-    const description = (input.description ?? `Payment ${intentId}`).slice(0, 255)
-    const invoice = await this.lnd.createInvoice({
+    const description = descriptionInput ?? pricing.description ?? `Payment ${intentId}`
+    assertUtf8Bound(description, MAX_DESCRIPTION_BYTES, 'description')
+
+    const invoice = await this.provider.createInvoice({
       orderId: intentId,
-      amountSats,
+      amountSats: pricing.amountSats,
       memo: description.slice(0, 120),
       expirySeconds: this.config.DEFAULT_INVOICE_EXPIRY_SECONDS,
     })
+    if (invoice.amountSats !== pricing.amountSats) {
+      throw paymentIntentError(502, 'PROVIDER_AMOUNT_MISMATCH', 'Provider returned a different amount')
+    }
 
-    // --- Generate and hash client secret ------------------------------------
-    // intentSecret is a random 32-byte hex stored with the intent.
-    // The clientSecret is derived from it deterministically, so idempotent
-    // retries can return the same clientSecret without storing plaintext.
     const intentSecret = randomBytes(32).toString('hex')
     const clientSecret = deriveClientSecret(intentSecret, intentId, tenantId)
-    const now = new Date().toISOString()
-
+    const now = new Date(this.now()).toISOString()
     const intent: PaymentIntent = {
       id: intentId,
       tenantId,
-      pricingRuleId,
-      paymentLinkId,
-      merchantOrderId,
-      amountSats: amountSats.toString(),
-      currency: 'sat',
+      merchantOrderId: merchantOrderId ?? null,
+      pricingRuleId: pricing.pricingRuleId,
+      paymentLinkId: input.paymentLinkId ?? null,
+      amountSats: pricing.amountSats.toString(),
+      currency: 'SAT',
       description,
-      metadata: input.metadata ? JSON.stringify(input.metadata) : null,
+      metadata,
       status: 'requires_payment',
       paymentRequest: invoice.paymentRequest,
       paymentHash: invoice.paymentHash,
       providerInvoiceId: invoice.providerInvoiceId,
       intentSecret,
-      clientSecretHash: sha256(clientSecret),
+      clientSecretHash: hashClientSecret(clientSecret),
       idempotencyKey: idempotencyKey ?? null,
       idempotencyPayloadHash: idempotencyKey ? payloadHash : null,
       expiresAt: invoice.expiresAt,
@@ -257,237 +430,316 @@ export class PaymentIntentService {
       createdAt: now,
       updatedAt: now,
     }
-
     this.repo.createPaymentIntent(intent)
-
-    // Start watching for settlement (non-blocking)
-    void this.watch(intent)
-
-    return { ...this.toMerchantResponse(intent), clientSecret }
+    void this.ensureWatcher(intent)
+    return { ...this.toMerchant(intent), clientSecret }
   }
 
-  // ---- Authorization (browser) --------------------------------------------
-
-  /**
-   * Verify a client_secret and return the intent if valid.
-   * Scopes the lookup to intentId + tenantId — prevents cross-intent enumeration.
-   * Uses timing-safe comparison.
-   */
-  authorize(
-    intentId: string,
-    tenantId: string,
-    clientSecret: string,
-  ): PaymentIntent | undefined {
-    const intent = this.repo.paymentIntent(intentId, tenantId)
-    if (!intent) return undefined
-
-    const expected = sha256(clientSecret)
-    const a = Buffer.from(intent.clientSecretHash, 'hex')
-    const b = Buffer.from(expected, 'hex')
-    if (a.length !== b.length || !timingSafeEqual(a, b)) return undefined
-
-    return intent
-  }
-
-  // ---- SSE listeners -------------------------------------------------------
-
-  listen(id: string, callback: (s: PaymentIntent) => void): () => void {
-    const set = this.listeners.get(id) ?? new Set()
-    set.add(callback)
-    this.listeners.set(id, set)
-    return () => {
-      set.delete(callback)
-      if (set.size === 0) this.listeners.delete(id)
-    }
-  }
-
-  // ---- Recovery (restart) --------------------------------------------------
-
-  /**
-   * Called at startup. For each non-terminal intent:
-   * 1. Query provider for current authoritative state (detects offline settlements)
-   * 2. Mark locally expired intents
-   * 3. Subscribe to live updates for intents still pending
-   *
-   * Uses bounded concurrency to avoid thundering herd on large datasets.
-   */
-  async recoverPendingIntents(): Promise<void> {
-    const pending = this.repo.pendingPaymentIntents()
-    const now = new Date()
-
-    // Process in batches of RECOVERY_CONCURRENCY
-    for (let i = 0; i < pending.length; i += this.RECOVERY_CONCURRENCY) {
-      const batch = pending.slice(i, i + this.RECOVERY_CONCURRENCY)
-      await Promise.allSettled(
-        batch.map(async (intent) => {
-          // Skip if already watching
-          if (this.watchers.has(intent.paymentHash)) return
-
-          // Check if locally expired
-          if (new Date(intent.expiresAt) <= now) {
-            this.repo.markIntentExpired(intent.paymentHash)
-            return
-          }
-
-          try {
-            // Query provider for authoritative current state
-            const current = await this.lnd.getInvoice(intent.paymentHash).catch(() => undefined)
-            if (current) {
-              const newStatus = invoiceStateToIntentStatus(current.state)
-              // Apply state update via compare-and-set — preserves terminal states
-              const changed = this.repo.updatePaymentIntentStatus(
-                intent.paymentHash,
-                current,
-                newStatus,
-              )
-              if (changed && this.webhookService && (newStatus === 'succeeded' || newStatus === 'failed')) {
-                const tenant = this.repo.tenant(intent.tenantId)
-                if (tenant) {
-                  const updated = this.repo.paymentIntentByHash(intent.paymentHash)
-                  if (updated) {
-                    void this.webhookService.enqueue(
-                      tenant,
-                      updated,
-                      newStatus === 'succeeded'
-                        ? 'payment_intent.succeeded'
-                        : 'payment_intent.failed',
-                    )
-                  }
-                }
-              }
-              // Only subscribe to still-pending intents
-              if (newStatus === 'requires_payment' || newStatus === 'processing') {
-                void this.watch(intent)
-              }
-            } else {
-              void this.watch(intent)
-            }
-          } catch {
-            // Non-fatal: log and continue; the intent remains in DB and will
-            // be reconciled on next periodic reconciliation pass
-            void this.watch(intent).catch(() => {/* ignore */})
-          }
-        }),
+  private resolvePricing(
+    input: CreatePaymentIntentInput,
+    quantity: number,
+  ): { amountSats: bigint; pricingRuleId: string | null; description: string | null } {
+    const references = Number(input.amountSats !== undefined)
+      + Number(input.productId !== undefined)
+      + Number(input.pricingRuleId !== undefined)
+    if (references !== 1) {
+      throw paymentIntentError(
+        400,
+        'INVALID_AMOUNT_SOURCE',
+        'Provide exactly one of amountSats, productId, or pricingRuleId',
       )
     }
+
+    if (input.amountSats !== undefined) {
+      if (typeof input.amountSats !== 'bigint') {
+        throw paymentIntentError(400, 'INVALID_AMOUNT', 'amountSats must be an integer')
+      }
+      if (input.quantity !== undefined && quantity !== 1) {
+        throw paymentIntentError(400, 'INVALID_QUANTITY', 'quantity is only valid for pricing rules')
+      }
+      return { amountSats: input.amountSats, pricingRuleId: null, description: null }
+    }
+
+    const rule = input.pricingRuleId
+      ? this.repo.pricingRuleById(input.tenantId, input.pricingRuleId)
+      : this.repo.pricingRule(input.tenantId, input.productId!)
+    return this.pricingFromRule(rule, quantity)
   }
 
-  // ---- Periodic reconciliation (call on interval e.g. every 5 min) ---------
-
-  async reconcile(): Promise<void> {
-    await this.recoverPendingIntents()
-  }
-
-  startReconciliationLoop(intervalMs = 300_000): () => void {
-    const timer = setInterval(() => {
-      void this.reconcile().catch((err) => {
-        console.error('Periodic reconciliation failed:', err)
-      })
-    }, intervalMs)
-    return () => clearInterval(timer)
-  }
-
-  // ---- Public projections --------------------------------------------------
-
-  toPublic(intent: PaymentIntent): PaymentIntentPublic {
+  private pricingFromRule(
+    rule: PricingRule | undefined,
+    quantity: number,
+  ): { amountSats: bigint; pricingRuleId: string; description: string | null } {
+    if (!rule?.active || rule.mode !== 'fixed' || rule.priceSats === null) {
+      throw paymentIntentError(404, 'PRICING_RULE_NOT_FOUND', 'Pricing rule is unavailable')
+    }
+    if (quantity > rule.maxQuantity) {
+      throw paymentIntentError(400, 'INVALID_QUANTITY', 'quantity exceeds the pricing-rule limit')
+    }
+    if (!/^\d+$/.test(rule.priceSats)) {
+      throw paymentIntentError(500, 'INVALID_PRICING_RULE', 'Pricing rule amount is invalid')
+    }
     return {
-      id: intent.id,
-      amountSats: intent.amountSats,
-      currency: intent.currency,
-      description: intent.description,
-      status: intent.status,
-      paymentRequest: intent.paymentRequest,
-      expiresAt: intent.expiresAt,
+      amountSats: BigInt(rule.priceSats) * BigInt(quantity),
+      pricingRuleId: rule.id,
+      description: rule.description ?? rule.name,
     }
   }
 
-  private toMerchantResponse(intent: PaymentIntent): Omit<PaymentIntentResponse, 'clientSecret'> {
+  private validateAmount(amountSats: bigint): void {
+    if (amountSats <= 0n) {
+      throw paymentIntentError(400, 'INVALID_AMOUNT', 'amountSats must be positive')
+    }
+    if (amountSats < this.config.MIN_INVOICE_SATS || amountSats > this.config.MAX_INVOICE_SATS) {
+      throw paymentIntentError(400, 'AMOUNT_OUT_OF_RANGE', 'amountSats is outside configured limits')
+    }
+  }
+
+  private idempotencyPayloadHash(input: {
+    productId: string | null
+    pricingRuleId: string | null
+    paymentLinkId: string | null
+    amountSats: bigint | undefined
+    quantity: number
+    merchantOrderId: string | null
+    description: string | null
+    metadata: string | null
+  }): string {
+    const normalized = canonicalJson({
+      amountSats: input.amountSats?.toString() ?? null,
+      description: input.description,
+      merchantOrderId: input.merchantOrderId,
+      metadata: input.metadata,
+      paymentLinkId: input.paymentLinkId,
+      pricingRuleId: input.pricingRuleId,
+      productId: input.productId,
+      quantity: input.quantity,
+    })
+    return sha256(`${IDEMPOTENCY_DOMAIN}\0${normalized}`)
+  }
+
+  private createResponse(intent: PaymentIntent): PaymentIntentCreateResponse {
+    return {
+      ...this.toMerchant(intent),
+      clientSecret: deriveClientSecret(intent.intentSecret, intent.id, intent.tenantId),
+    }
+  }
+
+  private toMerchant(intent: PaymentIntent): PaymentIntentMerchantView {
     return {
       id: intent.id,
       tenantId: intent.tenantId,
-      merchantOrderId: intent.merchantOrderId ?? null,
+      merchantOrderId: intent.merchantOrderId,
+      pricingRuleId: intent.pricingRuleId,
+      paymentLinkId: intent.paymentLinkId,
       amountSats: intent.amountSats,
       currency: intent.currency,
       description: intent.description,
+      metadata: intent.metadata ? JSON.parse(intent.metadata) as Record<string, unknown> : null,
       status: intent.status,
       paymentRequest: intent.paymentRequest,
       paymentHash: intent.paymentHash,
+      providerInvoiceId: intent.providerInvoiceId,
       expiresAt: intent.expiresAt,
       settledAt: intent.settledAt,
       createdAt: intent.createdAt,
+      updatedAt: intent.updatedAt,
     }
   }
 
-  // ---- Provider subscription -----------------------------------------------
-
-  /**
-   * Subscribe to invoice updates from the Lightning provider.
-   * Prevents duplicate subscriptions via the watchers registry.
-   * Compare-and-set state transition ensures terminal states are preserved.
-   */
-  private async watch(intent: PaymentIntent): Promise<void> {
-    if (this.watchers.has(intent.paymentHash)) return
-
-    // Register a placeholder immediately to prevent concurrent duplicate calls
-    this.watchers.set(intent.paymentHash, () => Promise.resolve())
-
-    const cleanup = await this.lnd.subscribeToInvoice(intent.paymentHash, (lndInvoice) => {
-      const newStatus = invoiceStateToIntentStatus(lndInvoice.state)
-
-      // Compare-and-set: only update if the transition is valid
-      const changed = this.repo.updatePaymentIntentStatus(intent.paymentHash, lndInvoice, newStatus)
-      if (!changed) return  // Stale event for already-terminal intent — ignore
-
-      const updated = this.repo.paymentIntentByHash(intent.paymentHash)
-      if (!updated) return
-
-      // Notify SSE listeners
-      for (const listener of this.listeners.get(intent.id) ?? []) {
-        listener(updated)
-      }
-
-      // Trigger webhook exactly once per terminal state change
-      if (newStatus === 'succeeded' || newStatus === 'failed' || newStatus === 'expired') {
-        const tenant = this.repo.tenant(intent.tenantId)
-        if (tenant && this.webhookService) {
-          void this.webhookService.enqueue(
-            tenant,
-            updated,
-            newStatus === 'succeeded'
-              ? 'payment_intent.succeeded'
-              : newStatus === 'expired'
-                ? 'payment_intent.expired'
-                : 'payment_intent.failed',
-          )
+  private async reconcileNonTerminalIntents(): Promise<void> {
+    const intents = this.repo.nonTerminalPaymentIntents()
+    let nextIndex = 0
+    const workers = Array.from(
+      { length: Math.min(this.recoveryConcurrency, intents.length) },
+      async () => {
+        while (!this.shuttingDown) {
+          const index = nextIndex++
+          const intent = intents[index]
+          if (!intent) return
+          await this.reconcileIntent(intent)
         }
-        // Clean up watcher once in terminal state
-        const cleanupFn = this.watchers.get(intent.paymentHash)
-        if (cleanupFn) { void cleanupFn(); this.watchers.delete(intent.paymentHash) }
-      }
-    })
-
-    // Store the real cleanup function returned by the provider
-    this.watchers.set(intent.paymentHash, cleanup)
+      },
+    )
+    await Promise.allSettled(workers)
   }
 
-  // ---- Idempotency helpers ------------------------------------------------
+  private async reconcileIntent(intent: PaymentIntent): Promise<void> {
+    let providerInvoice: LightningInvoice | undefined
+    try {
+      providerInvoice = await this.provider.getInvoice(intent.paymentHash)
+      await this.applyProviderInvoice(intent.tenantId, intent.paymentHash, providerInvoice)
+    } catch (error) {
+      this.logger.error('Payment Intent provider reconciliation failed', error)
+    }
 
-  /**
-   * Build a canonical payload hash that covers all behavior-affecting fields.
-   * Must include: product, quantity, amount, merchant order, description, metadata.
-   */
-  private buildPayloadHash(input: CreatePaymentIntentInput): string {
-    return sha256(
-      JSON.stringify({
-        productId: input.productId ?? null,
-        quantity: input.quantity ?? 1,
-        amountSats: input.amountSats?.toString() ?? null,
-        merchantOrderId: input.merchantOrderId ?? null,
-        description: input.description ?? null,
-        metadata: input.metadata ?? null,
-        pricingRuleId: input.pricingRuleId ?? null,
-        paymentLinkId: input.paymentLinkId ?? null,
-      }),
+    const current = this.repo.paymentIntentByHash(intent.tenantId, intent.paymentHash)
+    if (!current || TERMINAL_STATUSES.has(current.status)) {
+      await this.stopWatcher(intent.paymentHash)
+      return
+    }
+
+    if (Date.parse(current.expiresAt) <= this.now()) {
+      await this.transition(current, 'expired', providerInvoice)
+      return
+    }
+
+    await this.ensureWatcher(current)
+  }
+
+  private async applyProviderInvoice(
+    tenantId: string,
+    paymentHash: string,
+    invoice: LightningInvoice,
+  ): Promise<void> {
+    if (invoice.paymentHash !== paymentHash) {
+      throw new Error('Provider returned an invoice with an unexpected payment hash')
+    }
+    const nextStatus = providerStatus(invoice.state)
+    if (!nextStatus) return
+    const current = this.repo.paymentIntentByHash(tenantId, paymentHash)
+    if (!current) return
+    await this.transition(current, nextStatus, invoice)
+  }
+
+  private async transition(
+    current: PaymentIntent,
+    nextStatus: PaymentIntentStatus,
+    invoice?: LightningInvoice,
+  ): Promise<boolean> {
+    if (!ALLOWED_TRANSITIONS[current.status].has(nextStatus)) return false
+    const updatedAt = new Date(this.now()).toISOString()
+    const changed = this.repo.transitionPaymentIntent({
+      tenantId: current.tenantId,
+      paymentHash: current.paymentHash,
+      fromStatus: current.status,
+      toStatus: nextStatus,
+      invoice,
+      updatedAt,
+    })
+    if (!changed) return false
+
+    const updated = this.repo.paymentIntentByHash(current.tenantId, current.paymentHash)
+    if (!updated) return false
+    for (const listener of this.listeners.get(updated.id) ?? []) listener(updated)
+
+    if (TERMINAL_STATUSES.has(updated.status)) {
+      await this.stopWatcher(updated.paymentHash)
+      this.clearWatcherRetry(updated.paymentHash)
+      await this.emitTerminalEvent(updated)
+    }
+    return true
+  }
+
+  private async emitTerminalEvent(intent: PaymentIntent): Promise<void> {
+    if (!this.eventSink) return
+    const payload = canonicalJson({
+      amountSats: intent.amountSats,
+      createdAt: intent.createdAt,
+      currency: intent.currency,
+      id: intent.id,
+      merchantOrderId: intent.merchantOrderId,
+      status: intent.status,
+      settledAt: intent.settledAt,
+      tenantId: intent.tenantId,
+      updatedAt: intent.updatedAt,
+    })
+    await this.eventSink.enqueuePaymentIntentEvent(
+      intent.tenantId,
+      intent.id,
+      `payment_intent.${intent.status}`,
+      payload,
     )
+  }
+
+  private async ensureWatcher(intent: PaymentIntent): Promise<void> {
+    if (this.shuttingDown || TERMINAL_STATUSES.has(intent.status)) return
+    if (this.watchers.has(intent.paymentHash) || this.watcherRetryTimers.has(intent.paymentHash)) {
+      return
+    }
+
+    const entry: WatcherEntry = { stopRequested: false }
+    this.watchers.set(intent.paymentHash, entry)
+    try {
+      const cleanup = await this.provider.subscribeToInvoice(intent.paymentHash, (invoice) => {
+        void this.applyProviderInvoice(intent.tenantId, intent.paymentHash, invoice).catch(
+          (error: unknown) => this.logger.error('Payment Intent watcher callback failed', error),
+        )
+      })
+      entry.cleanup = cleanup
+      this.watcherRetryAttempts.delete(intent.paymentHash)
+      if (entry.stopRequested || this.shuttingDown || !this.watchers.has(intent.paymentHash)) {
+        await cleanup().catch((error: unknown) => {
+          this.logger.error('Payment Intent watcher cleanup failed', error)
+        })
+        this.watchers.delete(intent.paymentHash)
+      }
+    } catch (error) {
+      if (this.watchers.get(intent.paymentHash) === entry) {
+        this.watchers.delete(intent.paymentHash)
+      }
+      this.logger.error('Payment Intent watcher subscription failed', error)
+      this.scheduleWatcherRetry(intent)
+    }
+  }
+
+  private async stopWatcher(paymentHash: string): Promise<void> {
+    const watcher = this.watchers.get(paymentHash)
+    if (!watcher) return
+    watcher.stopRequested = true
+    this.watchers.delete(paymentHash)
+    if (watcher.cleanup) {
+      await watcher.cleanup().catch((error: unknown) => {
+        this.logger.error('Payment Intent watcher cleanup failed', error)
+      })
+    }
+  }
+
+  private scheduleWatcherRetry(intent: PaymentIntent): void {
+    if (this.shuttingDown || this.watcherRetryTimers.has(intent.paymentHash)) return
+    const attempt = this.watcherRetryAttempts.get(intent.paymentHash) ?? 0
+    this.watcherRetryAttempts.set(intent.paymentHash, attempt + 1)
+    const exponential = Math.min(
+      this.watcherRetryMaxMs,
+      this.watcherRetryBaseMs * (2 ** Math.min(attempt, 16)),
+    )
+    const delay = Math.min(
+      this.watcherRetryMaxMs,
+      exponential + Math.floor(exponential * 0.2 * this.random()),
+    )
+    const timer = setTimeout(() => {
+      this.watcherRetryTimers.delete(intent.paymentHash)
+      const current = this.repo.paymentIntentByHash(intent.tenantId, intent.paymentHash)
+      if (current && !TERMINAL_STATUSES.has(current.status)) void this.ensureWatcher(current)
+    }, delay)
+    timer.unref?.()
+    this.watcherRetryTimers.set(intent.paymentHash, timer)
+  }
+
+  private clearWatcherRetry(paymentHash: string): void {
+    const timer = this.watcherRetryTimers.get(paymentHash)
+    if (timer) clearTimeout(timer)
+    this.watcherRetryTimers.delete(paymentHash)
+    this.watcherRetryAttempts.delete(paymentHash)
+  }
+
+  private stopReconciliationLoop(): void {
+    if (this.reconciliationTimer) clearInterval(this.reconciliationTimer)
+    this.reconciliationTimer = undefined
+  }
+
+  private async withTenantCreationLock<T>(tenantId: string, task: () => Promise<T>): Promise<T> {
+    const previous = this.creationLocks.get(tenantId) ?? Promise.resolve()
+    let release!: () => void
+    const current = new Promise<void>((resolve) => { release = resolve })
+    const tail = previous.then(() => current)
+    this.creationLocks.set(tenantId, tail)
+    await previous
+    try {
+      return await task()
+    } finally {
+      release()
+      if (this.creationLocks.get(tenantId) === tail) this.creationLocks.delete(tenantId)
+    }
   }
 }

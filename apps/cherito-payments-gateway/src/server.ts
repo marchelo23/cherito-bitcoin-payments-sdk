@@ -1,4 +1,4 @@
-import Fastify from 'fastify'
+import Fastify, { type FastifyInstance } from 'fastify'
 import cors from '@fastify/cors'
 import { z } from 'zod'
 import { writeFile } from 'node:fs/promises'
@@ -7,63 +7,87 @@ import {
   LightningError,
   loadCredential,
   type Bolt12ReceiveProvider,
+  type LightningReceiveProvider,
 } from '@cherito/bitcoin-sdk'
 import { loadConfig, type Config } from './config.js'
 import { Repository } from './persistence/repository.js'
-import { TenantRepository } from './persistence/tenant-repository.js'
+import {
+  PaymentIntentRepository,
+  type PaymentIntent,
+} from './persistence/payment-intent-repository.js'
+import { WebhookRepository } from './persistence/webhook-repository.js'
 import { PaymentService } from './services/payment-service.js'
 import { PaymentIntentService } from './services/payment-intent-service.js'
 import { ApiKeyService } from './services/api-key-service.js'
 import { TenantService } from './services/tenant-service.js'
 import { WebhookService } from './services/webhook-service.js'
 import { LndkProvider } from './services/lndk-provider.js'
-import type { PaymentIntent } from './persistence/repository.js'
+import { PaymentIntentSecretCipher } from './security/payment-intent-secret-cipher.js'
 
-// ---------------------------------------------------------------------------
-// Request schema validators
-// ---------------------------------------------------------------------------
+const PRODUCT_ID = /^[a-z0-9][a-z0-9-]{1,78}[a-z0-9]$/
+const TENANT_ID = /^tnt_[0-9a-f-]{36}$/
 
 const createIntentBody = z
   .object({
-    productId: z.string().regex(/^[a-z0-9_-]{3,80}$/),
-    quantity: z.number().int().min(1).max(100).optional().default(1),
+    amountSats: z.string().regex(/^\d+$/, 'amountSats must be a decimal integer string').optional(),
+    productId: z.string().regex(PRODUCT_ID).optional(),
+    pricingRuleId: z.string().min(1).max(100).optional(),
+    quantity: z.number().int().min(1).max(100).optional(),
+    merchantOrderId: z.string().min(1).max(200).optional(),
     description: z.string().max(500).optional(),
     metadata: z.record(z.string(), z.unknown()).optional(),
-    idempotencyKey: z.string().uuid().optional(),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    const sources = Number(value.amountSats !== undefined)
+      + Number(value.productId !== undefined)
+      + Number(value.pricingRuleId !== undefined)
+    if (sources !== 1) {
+      context.addIssue({
+        code: 'custom',
+        message: 'Provide exactly one of amountSats, productId, or pricingRuleId',
+      })
+    }
+  })
+
+const checkoutBody = z
+  .object({
+    productId: z.string().regex(/^[a-z0-9-]{3,80}$/),
+    quantity: z.number().int().min(1).max(10),
   })
   .strict()
 
-const offerBody = z
-  .object({ productId: z.string().regex(/^[a-z0-9_-]{3,80}$/) })
-  .strict()
-
-// ---------------------------------------------------------------------------
-// Auth helpers
-// ---------------------------------------------------------------------------
+const offerBody = z.object({ productId: z.string().regex(/^[a-z0-9-]{3,80}$/) }).strict()
 
 const extractBearer = (header: unknown): string =>
   typeof header === 'string' ? header.replace(/^Bearer\s+/i, '') : ''
 
-// ---------------------------------------------------------------------------
-// Server builder
-// ---------------------------------------------------------------------------
+export interface BuildServerDependencies {
+  lnd?: LightningReceiveProvider
+  bolt12?: Bolt12ReceiveProvider
+  startBackgroundJobs?: boolean
+}
 
-export async function buildServer(config: Config = loadConfig()): Promise<ReturnType<typeof Fastify>> {
-  // ---- Credentials ---------------------------------------------------------
-  const [cert, macaroon] = await Promise.all([
-    loadCredential(config.LND_TLS_CERT_PATH, config.LND_TLS_CERT_BASE64, 'base64'),
-    loadCredential(config.LND_MACAROON_PATH, config.LND_MACAROON_HEX, 'hex'),
-  ])
+export async function buildServer(
+  config: Config = loadConfig(),
+  dependencies: BuildServerDependencies = {},
+): Promise<FastifyInstance> {
+  let lnd = dependencies.lnd
+  if (!lnd) {
+    const [certificate, macaroon] = await Promise.all([
+      loadCredential(config.LND_TLS_CERT_PATH, config.LND_TLS_CERT_BASE64, 'base64'),
+      loadCredential(config.LND_MACAROON_PATH, config.LND_MACAROON_HEX, 'hex'),
+    ])
+    lnd = new LndRestProvider({
+      url: config.LND_REST_URL,
+      tlsCertificate: certificate,
+      macaroon,
+      timeoutMs: 8_000,
+    })
+  }
 
-  const lnd = new LndRestProvider({
-    url: config.LND_REST_URL,
-    tlsCertificate: cert,
-    macaroon,
-    timeoutMs: 8000,
-  })
-
-  let bolt12: Bolt12ReceiveProvider | undefined
-  if (config.BOLT12_PROVIDER === 'lndk') {
+  let bolt12 = dependencies.bolt12
+  if (!bolt12 && config.BOLT12_PROVIDER === 'lndk') {
     try {
       bolt12 = await LndkProvider.connect({
         url: config.LNDK_GRPC_URL!,
@@ -71,68 +95,64 @@ export async function buildServer(config: Config = loadConfig()): Promise<Return
         macaroonPath: config.LNDK_MACAROON_PATH!,
       })
     } catch (error) {
-      console.warn(
-        JSON.stringify({
-          level: 'warn',
-          code: 'LNDK_UNAVAILABLE',
-          message: error instanceof Error ? error.message : 'LNDK unavailable',
-        }),
-      )
+      console.warn(JSON.stringify({
+        level: 'warn',
+        code: 'LNDK_UNAVAILABLE',
+        message: error instanceof Error ? error.message : 'LNDK unavailable',
+      }))
     }
   }
 
-  // ---- Services ------------------------------------------------------------
-  const repo = new Repository(config.DATABASE_URL)
-  const tenantRepo = new TenantRepository(config.DATABASE_URL)
-  const apiKeyService = new ApiKeyService(tenantRepo)
-  const tenantService = new TenantService(tenantRepo, apiKeyService)
-  const webhookService = new WebhookService(repo)
-
+  const intentSecretCipher = new PaymentIntentSecretCipher(
+    config.CHERITO_INTENT_SECRET_KEY,
+    config.CHERITO_INTENT_SECRET_PREVIOUS_KEYS,
+  )
+  const paymentIntentRepo = new PaymentIntentRepository(
+    config.DATABASE_URL,
+    intentSecretCipher,
+    config.SQLITE_BUSY_TIMEOUT_MS,
+  )
+  if (paymentIntentRepo.tenantCount() === 0 && !config.BOOTSTRAP_KEY_PATH) {
+    paymentIntentRepo.close()
+    throw new Error(
+      'BOOTSTRAP_KEY_PATH is required when initializing an empty merchant database',
+    )
+  }
+  const legacyRepo = new Repository(config.DATABASE_URL)
+  const webhookRepo = new WebhookRepository(config.DATABASE_URL)
+  const apiKeyService = new ApiKeyService(paymentIntentRepo)
+  const tenantService = new TenantService(paymentIntentRepo, apiKeyService)
+  const webhookService = new WebhookService(webhookRepo, paymentIntentRepo)
   const paymentIntentService = new PaymentIntentService(
     lnd,
-    bolt12,
-    repo,
+    paymentIntentRepo,
     config,
     tenantService,
     webhookService,
+    {
+      recoveryConcurrency: config.PAYMENT_INTENT_RECOVERY_CONCURRENCY,
+      reconciliationIntervalMs: config.PAYMENT_INTENT_RECONCILIATION_INTERVAL_MS,
+      watcherRetryBaseMs: config.PAYMENT_INTENT_WATCH_RETRY_BASE_MS,
+      watcherRetryMaxMs: config.PAYMENT_INTENT_WATCH_RETRY_MAX_MS,
+    },
   )
+  const legacyPaymentService = new PaymentService(lnd, bolt12, legacyRepo, config)
 
-  // Legacy service (for backward-compatible /v1/checkout-sessions routes)
-  const legacyPaymentService = new PaymentService(lnd, bolt12, repo, config)
-
-  // ---- Bootstrap (first-run) -----------------------------------------------
-  // If no tenants exist, create a default tenant and emit the API key.
-  // This key is the only way to access the Payment Intent API.
-  const tenants = repo['db'].prepare('SELECT COUNT(*) as count FROM tenants').get() as { count: number }
-  if (tenants.count === 0) {
+  if (paymentIntentRepo.tenantCount() === 0) {
     const { tenant, apiKey } = await tenantService.createTenant({
       name: config.BOOTSTRAP_TENANT_NAME,
       apiKeyLabel: 'bootstrap',
     })
-    const keyMessage = [
-      '='.repeat(70),
-      'CHERITO FIRST-RUN: Merchant API key (shown once — store securely)',
-      `Tenant ID : ${tenant.id}`,
-      `API Key   : ${apiKey}`,
-      '='.repeat(70),
-    ].join('\n')
-
-    if (config.BOOTSTRAP_KEY_PATH) {
-      await writeFile(config.BOOTSTRAP_KEY_PATH, `${apiKey}\n`, { mode: 0o600 })
-      console.info(
-        JSON.stringify({
-          level: 'info',
-          code: 'BOOTSTRAP_KEY_WRITTEN',
-          path: config.BOOTSTRAP_KEY_PATH,
-          tenantId: tenant.id,
-          keyPrefix: apiKey.slice(0, 12),
-        }),
-      )
-    } else {
-      console.log(keyMessage)
-    }
-
-    // Seed the legacy "cherito-coffee-001" catalog entry for the default tenant
+    await writeFile(config.BOOTSTRAP_KEY_PATH!, `${apiKey}\n`, {
+      mode: 0o600,
+      flag: 'wx',
+    })
+    console.info(JSON.stringify({
+      level: 'info',
+      code: 'BOOTSTRAP_KEY_WRITTEN',
+      path: config.BOOTSTRAP_KEY_PATH,
+      tenantId: tenant.id,
+    }))
     tenantService.upsertPricingRule(tenant.id, {
       productId: 'cherito-coffee-001',
       mode: 'fixed',
@@ -144,14 +164,15 @@ export async function buildServer(config: Config = loadConfig()): Promise<Return
     })
   }
 
-  // ---- Recovery after restart ----------------------------------------------
   await paymentIntentService.recoverPendingIntents()
 
-  // ---- Start background jobs ----------------------------------------------
-  const stopReconciliation = paymentIntentService.startReconciliationLoop(60_000)
-  const stopRetry = webhookService.startRetryLoop()
+  let stopReconciliation = () => {}
+  let stopWebhookRetry = () => {}
+  if (dependencies.startBackgroundJobs !== false) {
+    stopReconciliation = paymentIntentService.startReconciliationLoop()
+    stopWebhookRetry = webhookService.startRetryLoop()
+  }
 
-  // ---- Fastify setup -------------------------------------------------------
   const app = Fastify({
     logger: {
       level: config.LOG_LEVEL,
@@ -160,12 +181,13 @@ export async function buildServer(config: Config = loadConfig()): Promise<Return
         'req.headers.grpc-metadata-macaroon',
         '*.macaroon',
         '*.certificate',
+        '*.clientSecret',
         '*.clientSecretHash',
-        '*.client_secret_hash',
+        '*.intentSecret',
+        '*.CHERITO_INTENT_SECRET_KEY',
+        '*.CHERITO_INTENT_SECRET_PREVIOUS_KEYS',
         '*.webhookSecret',
-        '*.webhook_secret',
         '*.keyHash',
-        '*.key_hash',
       ],
     },
     bodyLimit: 16_384,
@@ -173,21 +195,29 @@ export async function buildServer(config: Config = loadConfig()): Promise<Return
   })
 
   app.addHook('onClose', async () => {
-    stopRetry()
+    stopWebhookRetry()
     stopReconciliation()
+    await paymentIntentService.shutdown()
+    paymentIntentRepo.close()
+    webhookRepo.close()
+    legacyRepo.close()
   })
 
   await app.register(cors, {
     origin: (origin, callback) => {
-      const allowed = config.ALLOWED_ORIGINS.split(',').map((x) => x.trim())
+      const allowed = config.ALLOWED_ORIGINS.split(',').map((value) => value.trim())
       callback(null, !origin || allowed.includes(origin))
     },
-    methods: ['GET', 'POST', 'DELETE'],
-    allowedHeaders: ['content-type', 'authorization', 'idempotency-key'],
+    methods: ['GET', 'POST'],
+    allowedHeaders: [
+      'content-type',
+      'authorization',
+      'idempotency-key',
+      'x-cherito-tenant-id',
+    ],
   })
 
-  // Security headers on every response
-  app.addHook('onSend', async (_req, reply, payload) => {
+  app.addHook('onSend', async (_request, reply, payload) => {
     reply.headers({
       'x-content-type-options': 'nosniff',
       'x-frame-options': 'DENY',
@@ -198,348 +228,229 @@ export async function buildServer(config: Config = loadConfig()): Promise<Return
     return payload
   })
 
-  // ---- Rate limiter (simple in-process) ------------------------------------
   type RateBucket = { start: number; count: number }
   const ipRates = new Map<string, RateBucket>()
-
-  function checkRateLimit(ip: string): boolean {
+  const checkRateLimit = (ip: string): boolean => {
     const now = Date.now()
     const bucket = ipRates.get(ip)
     if (!bucket || now - bucket.start >= 60_000) {
       ipRates.set(ip, { start: now, count: 1 })
       return true
     }
-    if (++bucket.count > config.RATE_LIMIT_CREATE_INVOICE) return false
-    return true
+    bucket.count += 1
+    return bucket.count <= config.RATE_LIMIT_CREATE_INVOICE
   }
 
-  // ---- Middleware: Merchant API key auth -----------------------------------
-  async function requireMerchantAuth(
-    req: { headers: { authorization?: string } },
-    reply: { code: (n: number) => { send: (body: unknown) => unknown } },
-  ): Promise<{ tenantId: string } | undefined> {
-    const raw = extractBearer(req.headers.authorization)
-    const auth = apiKeyService.verify(raw)
-    if (!auth) {
-      reply.code(401).send({ code: 'UNAUTHORIZED', message: 'Valid merchant API key required' })
-      return undefined
-    }
-    return auth
+  const requireMerchantAuth = (
+    authorization: string | undefined,
+  ): { tenantId: string } | undefined => apiKeyService.verify(extractBearer(authorization))
+
+  const requireClientIntent = (
+    headers: Record<string, string | string[] | undefined>,
+    intentId: string,
+  ): PaymentIntent | undefined => {
+    const tenantHeader = headers['x-cherito-tenant-id']
+    const tenantId = typeof tenantHeader === 'string' ? tenantHeader : ''
+    if (!TENANT_ID.test(tenantId)) return undefined
+    return paymentIntentService.authorizeClient(
+      tenantId,
+      intentId,
+      extractBearer(headers.authorization),
+    )
   }
 
-  // =========================================================================
-  // Routes
-  // =========================================================================
-
-  // ---- Health & info -------------------------------------------------------
-  app.get('/health', async (_req, reply) => {
+  app.get('/health', async (_request, reply) => {
     try {
       await lnd.getNodeInfo()
-      return { status: 'ok', lightning: 'connected', provider: 'lnd' }
+      return { status: 'ok', lightning: 'connected', provider: lnd.providerType }
     } catch {
-      return reply.code(503).send({ status: 'degraded', lightning: 'disconnected', provider: 'lnd' })
+      return reply.code(503).send({
+        status: 'degraded',
+        lightning: 'disconnected',
+        provider: lnd.providerType,
+      })
     }
   })
 
   app.get('/v1/node', () => lnd.getNodeInfo())
-
   app.get('/v1/capabilities', async () => {
     const base = await lnd.getCapabilities()
-    const extra = bolt12
-      ? await bolt12.getCapabilities().catch(() => undefined)
-      : undefined
+    const extra = bolt12 ? await bolt12.getCapabilities().catch(() => undefined) : undefined
     return { ...base, bolt12Receive: extra?.bolt12Receive === true }
   })
 
-  // =========================================================================
-  // Payment Intent API (v2 — merchant-authenticated)
-  // =========================================================================
-
-  /**
-   * Create a Payment Intent.
-   * Requires: Authorization: Bearer sk_live_...
-   * The returned clientSecret is for the browser only — it cannot be reused
-   * to create new intents.
-   */
-  app.post('/v1/payment-intents', async (req, reply) => {
-    const auth = await requireMerchantAuth(req, reply)
-    if (!auth) return
-
-    if (!checkRateLimit(req.ip)) {
+  app.post('/v1/payment-intents', async (request, reply) => {
+    const auth = requireMerchantAuth(request.headers.authorization)
+    if (!auth) {
+      return reply.code(401).send({ code: 'UNAUTHORIZED', message: 'Valid merchant API key required' })
+    }
+    if (!checkRateLimit(request.ip)) {
       return reply.code(429).send({ code: 'RATE_LIMITED', message: 'Too many requests' })
     }
-
-    const body = createIntentBody.parse(req.body)
-    const idempotencyKey = (req.headers as Record<string, string>)['idempotency-key'] ?? body.idempotencyKey
-
+    const body = createIntentBody.parse(request.body)
+    const idempotencyHeader = request.headers['idempotency-key']
+    const idempotencyKey = typeof idempotencyHeader === 'string' ? idempotencyHeader : undefined
     if (idempotencyKey && !z.string().uuid().safeParse(idempotencyKey).success) {
       return reply.code(400).send({
         code: 'INVALID_IDEMPOTENCY_KEY',
         message: 'Idempotency-Key must be a UUID',
       })
     }
-
     const result = await paymentIntentService.create({
       tenantId: auth.tenantId,
+      amountSats: body.amountSats === undefined ? undefined : BigInt(body.amountSats),
       productId: body.productId,
+      pricingRuleId: body.pricingRuleId,
       quantity: body.quantity,
+      merchantOrderId: body.merchantOrderId,
       description: body.description,
-      metadata: body.metadata as Record<string, unknown> | undefined,
+      metadata: body.metadata,
       idempotencyKey,
     })
-
     return reply.code(201).send(result)
   })
 
-  /**
-   * Retrieve a Payment Intent (merchant view — includes full details).
-   * Requires: Authorization: Bearer sk_live_...
-   */
-  app.get<{ Params: { id: string } }>(
-    '/v1/payment-intents/:id',
-    async (req, reply) => {
-      const auth = await requireMerchantAuth(req, reply)
-      if (!auth) return
+  app.get<{ Params: { id: string } }>('/v1/payment-intents/:id', async (request, reply) => {
+    const auth = requireMerchantAuth(request.headers.authorization)
+    if (!auth) {
+      return reply.code(401).send({ code: 'UNAUTHORIZED', message: 'Valid merchant API key required' })
+    }
+    const intent = paymentIntentService.getMerchantIntent(auth.tenantId, request.params.id)
+    return intent ?? reply.code(404).send({ code: 'NOT_FOUND', message: 'Payment intent not found' })
+  })
 
-      const intent = repo.paymentIntent(req.params.id, auth.tenantId)
+  app.get<{ Params: { id: string } }>(
+    '/v1/payment-intents/:id/status',
+    async (request, reply) => {
+      const intent = requireClientIntent(request.headers, request.params.id)
       if (!intent) {
         return reply.code(404).send({ code: 'NOT_FOUND', message: 'Payment intent not found' })
       }
-      return paymentIntentService.toPublic(intent)
+      return paymentIntentService.toClient(intent)
     },
   )
 
-  /**
-   * SSE event stream for a Payment Intent.
-   * Requires: Authorization: Bearer cs_... (client secret, scoped read-only token)
-   * This endpoint is safe to call from the browser.
-   */
   app.get<{ Params: { id: string } }>(
     '/v1/payment-intents/:id/events',
-    async (req, reply) => {
-      // Client secret auth — browser-safe
-      const clientSecret = extractBearer(req.headers.authorization)
-
-      // We need the tenantId; read it from the intent record using a hash lookup
-      // The intent exists if the payment hash exists; use a hash-agnostic lookup
-      const allIntentRow = repo['db']
-        .prepare('SELECT id, tenant_id FROM payment_intents WHERE id=?')
-        .get(req.params.id) as { id: string; tenant_id: string } | undefined
-
-      if (!allIntentRow) {
+    async (request, reply) => {
+      const intent = requireClientIntent(request.headers, request.params.id)
+      if (!intent) {
         return reply.code(404).send({ code: 'NOT_FOUND', message: 'Payment intent not found' })
       }
-
-      const intent = paymentIntentService.authorize(
-        req.params.id,
-        allIntentRow.tenant_id,
-        clientSecret,
-      )
-      if (!intent) {
-        return reply.code(401).send({ code: 'INVALID_CLIENT_SECRET', message: 'Invalid client secret' })
-      }
-
       reply.hijack()
       reply.raw.writeHead(200, {
         'content-type': 'text/event-stream',
         'cache-control': 'no-cache, no-transform',
         'connection': 'keep-alive',
       })
-
-      const send = (value: PaymentIntent) =>
-        reply.raw.write(
-          `event: payment_intent.${value.status}\ndata: ${JSON.stringify(paymentIntentService.toPublic(value))}\n\n`,
-        )
-
+      const send = (value: PaymentIntent) => reply.raw.write(
+        `event: payment_intent.${value.status}\ndata: ${JSON.stringify(paymentIntentService.toClient(value))}\n\n`,
+      )
       send(intent)
-
       const remove = paymentIntentService.listen(intent.id, send)
       const ping = setInterval(() => reply.raw.write(': keepalive\n\n'), 15_000)
-      req.raw.on('close', () => {
+      request.raw.on('close', () => {
         remove()
         clearInterval(ping)
       })
     },
   )
 
-  /**
-   * Get the public view of a Payment Intent using a client secret.
-   * Safe for browser polling (no SSE).
-   */
-  app.get<{ Params: { id: string } }>(
-    '/v1/payment-intents/:id/status',
-    async (req, reply) => {
-      const clientSecret = extractBearer(req.headers.authorization)
-
-      const allIntentRow = repo['db']
-        .prepare('SELECT id, tenant_id FROM payment_intents WHERE id=?')
-        .get(req.params.id) as { id: string; tenant_id: string } | undefined
-
-      if (!allIntentRow) {
-        return reply.code(404).send({ code: 'NOT_FOUND', message: 'Payment intent not found' })
-      }
-
-      const intent = paymentIntentService.authorize(
-        req.params.id,
-        allIntentRow.tenant_id,
-        clientSecret,
-      )
-      if (!intent) {
-        return reply.code(401).send({ code: 'INVALID_CLIENT_SECRET', message: 'Invalid client secret' })
-      }
-
-      return paymentIntentService.toPublic(intent)
-    },
-  )
-
-  // =========================================================================
-  // BOLT12 Offers
-  // =========================================================================
-
-  app.post('/v1/offers', async (req, reply) => {
-    const auth = await requireMerchantAuth(req, reply)
-    if (!auth) return
-
-    const body = offerBody.parse(req.body)
-    const rule = repo.pricingRule(auth.tenantId, body.productId)
-    if (!rule?.active || !rule.offerEnabled) {
-      return reply.code(404).send({ code: 'PRODUCT_NOT_FOUND', message: 'Product is not approved for Offers' })
-    }
-    if (!bolt12) {
-      return reply.code(501).send({ code: 'BOLT12_NOT_CONFIGURED', message: 'BOLT12 is not configured' })
-    }
-    const caps = await bolt12.getCapabilities()
-    if (!caps.bolt12Receive) {
-      return reply.code(503).send({ code: 'LNDK_UNAVAILABLE', message: 'LNDK is unavailable' })
-    }
-    const offer = await bolt12.createOffer({
-      productId: rule.productId,
-      amountSats: BigInt(rule.priceSats!),
-      description: rule.name,
-    })
-    repo.saveOffer(auth.tenantId, rule.productId, offer)
-    return { offerId: offer.offerId, offer: offer.offer, amountSats: offer.amountSats.toString() }
-  })
-
-  // =========================================================================
-  // Legacy: /v1/checkout-sessions (backward compatibility)
-  // =========================================================================
-
-  app.post('/v1/checkout-sessions', async (req, reply) => {
-    if (!checkRateLimit(req.ip)) {
+  // Existing APIs remain deliberately unchanged while callers migrate.
+  app.post('/v1/checkout-sessions', async (request, reply) => {
+    if (!checkRateLimit(request.ip)) {
       return reply.code(429).send({ code: 'RATE_LIMITED', message: 'Too many checkout requests' })
     }
-
-    const key = (req.headers as Record<string, string>)['idempotency-key']
+    const key = request.headers['idempotency-key']
     if (typeof key !== 'string' || !z.string().uuid().safeParse(key).success) {
       return reply.code(400).send({
         code: 'INVALID_IDEMPOTENCY_KEY',
         message: 'A UUID Idempotency-Key is required',
       })
     }
+    const input = checkoutBody.parse(request.body)
+    return reply.code(201).send(await legacyPaymentService.create(input.productId, input.quantity, key))
+  })
 
-    const checkoutBody = z
-      .object({
-        productId: z.string().regex(/^[a-z0-9-]{3,80}$/),
-        quantity: z.number().int().min(1).max(10),
-      })
-      .strict()
-
-    const input = checkoutBody.parse(req.body)
-
-    // Map to the legacy service for backward compatibility
-    const result = await legacyPaymentService.create(input.productId, input.quantity, key)
-    return reply.code(201).send(result)
+  app.get<{ Params: { id: string } }>('/v1/checkout-sessions/:id', async (request, reply) => {
+    const session = legacyPaymentService.authorize(
+      request.params.id,
+      extractBearer(request.headers.authorization),
+    )
+    return session
+      ? legacyPaymentService.public(session)
+      : reply.code(401).send({ code: 'INVALID_STATUS_TOKEN', message: 'Invalid status token' })
   })
 
   app.get<{ Params: { id: string } }>(
-    '/v1/checkout-sessions/:id',
-    async (req, reply) => {
-      const s = legacyPaymentService.authorize(
-        req.params.id,
-        extractBearer(req.headers.authorization),
-      )
-      return s
-        ? legacyPaymentService.public(s)
-        : reply.code(401).send({ code: 'INVALID_STATUS_TOKEN', message: 'Invalid status token' })
-    },
-  )
-
-  app.get<{ Params: { id: string } }>(
     '/v1/checkout-sessions/:id/events',
-    async (req, reply) => {
-      const s = legacyPaymentService.authorize(
-        req.params.id,
-        extractBearer(req.headers.authorization),
+    async (request, reply) => {
+      const session = legacyPaymentService.authorize(
+        request.params.id,
+        extractBearer(request.headers.authorization),
       )
-      if (!s) {
-        return reply.code(401).send({ code: 'INVALID_STATUS_TOKEN', message: 'Invalid status token' })
+      if (!session) {
+        return reply.code(401).send({
+          code: 'INVALID_STATUS_TOKEN',
+          message: 'Invalid status token',
+        })
       }
-
       reply.hijack()
       reply.raw.writeHead(200, {
         'content-type': 'text/event-stream',
         'cache-control': 'no-cache, no-transform',
         'connection': 'keep-alive',
       })
-
-      const send = (value: typeof s) =>
-        reply.raw.write(
-          `event: invoice.${value.state}\ndata: ${JSON.stringify({
-            checkoutSessionId: value.id,
-            orderId: value.orderId,
-            state: value.state,
-            expiresAt: value.expiresAt,
-          })}\n\n`,
-        )
-
-      send(s)
-      const remove = legacyPaymentService.listen(s.id, send)
+      const send = (value: typeof session) => reply.raw.write(
+        `event: invoice.${value.state}\ndata: ${JSON.stringify({
+          checkoutSessionId: value.id,
+          orderId: value.orderId,
+          state: value.state,
+          expiresAt: value.expiresAt,
+        })}\n\n`,
+      )
+      send(session)
+      const remove = legacyPaymentService.listen(session.id, send)
       const ping = setInterval(() => reply.raw.write(': keepalive\n\n'), 15_000)
-      req.raw.on('close', () => {
+      request.raw.on('close', () => {
         remove()
         clearInterval(ping)
       })
     },
   )
 
-  // =========================================================================
-  // Error handler
-  // =========================================================================
+  app.post('/v1/offers', async (request) => {
+    const input = offerBody.parse(request.body)
+    return legacyPaymentService.createOffer(input.productId)
+  })
 
-  app.setErrorHandler((error, req, reply) => {
-    const e = error as Error & { statusCode?: number; code?: string }
-    const status =
-      e.statusCode ??
-      (error instanceof z.ZodError ? 400 : error instanceof LightningError ? 502 : 500)
-
-    req.log.error({ code: e.code ?? 'INTERNAL_ERROR', message: e.message }, 'request failed')
-
+  app.setErrorHandler((error, request, reply) => {
+    const typed = error as Error & { statusCode?: number; code?: string }
+    const status = typed.statusCode
+      ?? (error instanceof z.ZodError ? 400 : error instanceof LightningError ? 502 : 500)
+    request.log.error(
+      { code: typed.code ?? 'INTERNAL_ERROR', message: typed.message },
+      'request failed',
+    )
     reply.code(status).send({
-      code: e.code ?? 'INTERNAL_ERROR',
-      message: status === 500 ? 'Internal server error' : e.message,
-      requestId: req.id,
+      code: typed.code ?? 'INTERNAL_ERROR',
+      message: status === 500 ? 'Internal server error' : typed.message,
+      requestId: request.id,
     })
   })
 
   return app
 }
 
-// ---------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------
-
 if (process.env.NODE_ENV !== 'test') {
   const config = loadConfig()
   buildServer(config)
     .then((app) => app.listen({ port: config.PORT, host: config.HOST }))
-    .catch((error) => {
-      console.error(
-        JSON.stringify({
-          level: 'fatal',
-          message: error instanceof Error ? error.message : 'Startup failed',
-        }),
-      )
+    .catch((error: unknown) => {
+      console.error(JSON.stringify({
+        level: 'fatal',
+        message: error instanceof Error ? error.message : 'Startup failed',
+      }))
       process.exitCode = 1
     })
 }

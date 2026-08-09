@@ -1,6 +1,8 @@
-import { DatabaseSync } from 'node:sqlite'
-import { mkdirSync } from 'node:fs'
-import { dirname } from 'node:path'
+import type { DatabaseSync } from 'node:sqlite'
+import {
+  openDatabase,
+  type DatabaseMigrationOptions,
+} from './database-lifecycle.js'
 
 // ---------------------------------------------------------------------------
 // Domain entities (tenant-scoped)
@@ -56,71 +58,14 @@ export interface PricingRule {
 }
 
 // ---------------------------------------------------------------------------
-// Minimal tenant schema (self-contained — no dependency on the full repo)
-// ---------------------------------------------------------------------------
-
-const TENANT_SCHEMA = `
-  PRAGMA journal_mode=WAL;
-  PRAGMA foreign_keys=ON;
-
-  CREATE TABLE IF NOT EXISTS schema_migrations (
-    version  INTEGER PRIMARY KEY,
-    applied_at TEXT NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS tenants (
-    id            TEXT PRIMARY KEY,
-    name          TEXT NOT NULL,
-    disabled      INTEGER NOT NULL DEFAULT 0,
-    webhook_url   TEXT,
-    webhook_secret TEXT,
-    prev_webhook_secret TEXT,
-    secret_rotated_at TEXT,
-    created_at    TEXT NOT NULL,
-    updated_at    TEXT NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS merchant_api_keys (
-    id         TEXT PRIMARY KEY,
-    tenant_id  TEXT NOT NULL REFERENCES tenants(id),
-    key_hash   TEXT UNIQUE NOT NULL,
-    key_prefix TEXT NOT NULL,
-    label      TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    revoked_at TEXT
-  );
-
-  CREATE TABLE IF NOT EXISTS pricing_rules (
-    id            TEXT PRIMARY KEY,
-    tenant_id     TEXT NOT NULL REFERENCES tenants(id),
-    product_id    TEXT NOT NULL,
-    name          TEXT NOT NULL,
-    description   TEXT,
-    mode          TEXT NOT NULL DEFAULT 'fixed',
-    price_sats    TEXT,
-    max_price_sats TEXT,
-    active        INTEGER NOT NULL DEFAULT 1,
-    max_quantity  INTEGER NOT NULL DEFAULT 10,
-    offer_enabled INTEGER NOT NULL DEFAULT 0,
-    created_at    TEXT NOT NULL,
-    updated_at    TEXT NOT NULL,
-    UNIQUE(tenant_id, product_id)
-  );
-`
-
-// ---------------------------------------------------------------------------
 // TenantRepository — all methods require tenantId to enforce isolation
 // ---------------------------------------------------------------------------
 
 export class TenantRepository {
   protected db: DatabaseSync
 
-  constructor(url: string) {
-    const file = url.replace(/^file:/, '')
-    mkdirSync(dirname(file), { recursive: true })
-    this.db = new DatabaseSync(file)
-    this.db.exec(TENANT_SCHEMA)
-    this.db.exec(`INSERT OR IGNORE INTO schema_migrations VALUES (1, '${new Date().toISOString()}')`)
+  constructor(url: string, options: DatabaseMigrationOptions = {}) {
+    this.db = openDatabase(url, options)
   }
 
   // ---- Tenants -------------------------------------------------------------

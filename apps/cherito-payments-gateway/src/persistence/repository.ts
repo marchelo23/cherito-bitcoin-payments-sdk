@@ -1,11 +1,35 @@
-import { DatabaseSync } from "node:sqlite";
-import { mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import type { DatabaseSync } from "node:sqlite";
+import { createHash, randomBytes } from 'node:crypto'
 import type {
   LightningInvoice,
   InvoiceState,
   CreatedOffer,
 } from "@cherito/bitcoin-sdk";
+import {
+  openDatabase,
+  type DatabaseMigrationOptions,
+} from './database-lifecycle.js'
+import type { PaymentIntentSecretCipher } from '../security/payment-intent-secret-cipher.js'
+import {
+  derivePaymentIntentClientSecret,
+  hashPaymentIntentClientSecret,
+} from '../security/payment-intent-client-capability.js'
+
+const LEGACY_TENANT_ID = 'legacy'
+
+function stableLegacyId(prefix: string, value: string): string {
+  return `${prefix}_${createHash('sha256').update(value).digest('hex').slice(0, 24)}`
+}
+
+function canonicalStatus(state: InvoiceState): string {
+  switch (state) {
+    case 'settled': return 'succeeded'
+    case 'accepted': return 'processing'
+    case 'expired': return 'expired'
+    case 'canceled': return 'canceled'
+    default: return 'requires_payment'
+  }
+}
 export interface Session {
   id: string;
   orderId: string;
@@ -20,23 +44,60 @@ export interface Session {
 }
 export class Repository {
   private db: DatabaseSync;
-  constructor(url: string) {
-    const file = url.replace(/^file:/, "");
-    mkdirSync(dirname(file), { recursive: true });
-    this.db = new DatabaseSync(file);
-    this.db.exec(
-      `PRAGMA journal_mode=WAL;PRAGMA foreign_keys=ON;CREATE TABLE IF NOT EXISTS products(id TEXT PRIMARY KEY,name TEXT NOT NULL,price_sats TEXT NOT NULL,active INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS orders(id TEXT PRIMARY KEY,product_id TEXT NOT NULL,quantity INTEGER NOT NULL,amount_sats TEXT NOT NULL,state TEXT NOT NULL,confirmed_at TEXT);CREATE TABLE IF NOT EXISTS lightning_invoices(id TEXT PRIMARY KEY,order_id TEXT NOT NULL,provider TEXT NOT NULL,payment_hash TEXT UNIQUE NOT NULL,payment_request TEXT NOT NULL,amount_sats TEXT NOT NULL,state TEXT NOT NULL,created_at TEXT NOT NULL,expires_at TEXT NOT NULL,settled_at TEXT,provider_add_index TEXT,provider_settle_index TEXT);CREATE TABLE IF NOT EXISTS checkout_sessions(id TEXT PRIMARY KEY,order_id TEXT NOT NULL,product_id TEXT NOT NULL,quantity INTEGER NOT NULL,amount_sats TEXT NOT NULL,payment_request TEXT NOT NULL,payment_hash TEXT NOT NULL,expires_at TEXT NOT NULL,state TEXT NOT NULL,token_hash TEXT NOT NULL);CREATE TABLE IF NOT EXISTS idempotency_records(key TEXT PRIMARY KEY,payload_hash TEXT NOT NULL,session_id TEXT NOT NULL,status_token TEXT NOT NULL,expires_at TEXT NOT NULL);CREATE TABLE IF NOT EXISTS bolt12_offers(id TEXT PRIMARY KEY,product_id TEXT NOT NULL,offer TEXT NOT NULL,amount_sats TEXT NOT NULL,created_at TEXT NOT NULL);
-       CREATE TABLE IF NOT EXISTS webhook_events (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, payment_intent_id TEXT NOT NULL, type TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(tenant_id, payment_intent_id, type));
-       CREATE TABLE IF NOT EXISTS webhook_deliveries (id TEXT PRIMARY KEY, event_id TEXT NOT NULL REFERENCES webhook_events(id), tenant_id TEXT NOT NULL, status TEXT NOT NULL, attempt_count INTEGER NOT NULL DEFAULT 0, last_attempt_at TEXT, next_attempt_at TEXT, delivered_at TEXT, created_at TEXT NOT NULL);`,
-    );
+  private readonly intentSecretCipher?: PaymentIntentSecretCipher
+  constructor(url: string, options: DatabaseMigrationOptions = {}) {
+    this.db = openDatabase(url, options)
+    this.intentSecretCipher = options.intentSecretCipher
   }
   createCheckout(
     s: Session,
     i: LightningInvoice,
     x: { key: string; payloadHash: string; token: string; expiresAt: string },
   ) {
+    const cipher = this.intentSecretCipher
+    if (!cipher) {
+      throw Object.assign(
+        new Error('CHERITO_INTENT_SECRET_KEY is required for legacy checkout compatibility'),
+        { code: 'DATABASE_ENCRYPTION_KEY_REQUIRED' },
+      )
+    }
     this.db.exec("BEGIN IMMEDIATE");
     try {
+      const now = new Date().toISOString()
+      const pricingRuleId = stableLegacyId('pr_legacy', s.productId)
+      const paymentIntentId = stableLegacyId('pi_legacy', s.id)
+      const unitPrice = (BigInt(s.amountSats) / BigInt(s.quantity)).toString()
+      const intentSecret = randomBytes(32).toString('hex')
+      const encrypted = cipher.encrypt(intentSecret, LEGACY_TENANT_ID, paymentIntentId)
+      const clientSecretHash = hashPaymentIntentClientSecret(
+        derivePaymentIntentClientSecret(intentSecret, paymentIntentId, LEGACY_TENANT_ID),
+      )
+
+      this.db.prepare(`
+        INSERT OR IGNORE INTO tenants
+          (id, name, disabled, webhook_url, webhook_secret, prev_webhook_secret,
+           secret_rotated_at, created_at, updated_at)
+        VALUES (?, 'Legacy Checkout', 0, NULL, NULL, NULL, NULL, ?, ?)
+      `).run(LEGACY_TENANT_ID, now, now)
+      this.db.prepare('INSERT OR IGNORE INTO products VALUES (?, ?, ?, 1)')
+        .run(s.productId, s.productId, unitPrice)
+      this.db.prepare(`
+        INSERT OR IGNORE INTO pricing_rules
+          (id, tenant_id, product_id, name, description, mode, price_sats,
+           max_price_sats, active, max_quantity, offer_enabled, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, 'fixed', ?, NULL, 1, 100, 0, ?, ?)
+      `).run(
+        pricingRuleId,
+        LEGACY_TENANT_ID,
+        s.productId,
+        s.productId,
+        'Legacy checkout compatibility rule',
+        unitPrice,
+        now,
+        now,
+      )
+      this.db.prepare('INSERT OR IGNORE INTO legacy_product_mappings VALUES (?, ?, ?, ?)')
+        .run(s.productId, LEGACY_TENANT_ID, pricingRuleId, now)
       this.db
         .prepare("INSERT INTO orders VALUES(?,?,?,?,?,NULL)")
         .run(s.orderId, s.productId, s.quantity, s.amountSats, "pending");
@@ -75,6 +136,52 @@ export class Repository {
       this.db
         .prepare("INSERT INTO idempotency_records VALUES(?,?,?,?,?)")
         .run(x.key, x.payloadHash, s.id, x.token, x.expiresAt);
+      this.db.prepare(`
+        INSERT INTO payment_intents (
+          id, tenant_id, merchant_order_id, pricing_rule_id, payment_link_id,
+          amount_sats, currency, description, metadata, status,
+          payment_request, payment_hash, provider_invoice_id,
+          intent_secret_version, intent_secret_key_id, intent_secret_nonce,
+          intent_secret_ciphertext, intent_secret_auth_tag, client_secret_hash,
+          idempotency_key, idempotency_payload_hash, expires_at, settled_at,
+          created_at, updated_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      `).run(
+        paymentIntentId,
+        LEGACY_TENANT_ID,
+        s.orderId,
+        pricingRuleId,
+        null,
+        s.amountSats,
+        'SAT',
+        `Legacy checkout ${s.orderId}`,
+        JSON.stringify({
+          legacy: {
+            checkoutSessionId: s.id,
+            orderId: s.orderId,
+            productId: s.productId,
+            quantity: s.quantity,
+          },
+        }),
+        canonicalStatus(s.state),
+        s.paymentRequest,
+        s.paymentHash,
+        i.providerInvoiceId,
+        encrypted.version,
+        encrypted.keyId,
+        encrypted.nonce,
+        encrypted.ciphertext,
+        encrypted.authTag,
+        clientSecretHash,
+        x.key,
+        x.payloadHash,
+        s.expiresAt,
+        null,
+        now,
+        now,
+      )
+      this.db.prepare('INSERT INTO legacy_checkout_mappings VALUES (?, ?, ?, ?, ?)')
+        .run(s.id, s.orderId, LEGACY_TENANT_ID, paymentIntentId, now)
       this.db.exec("COMMIT");
     } catch (e) {
       this.db.exec("ROLLBACK");
@@ -102,9 +209,47 @@ export class Repository {
         }
       | undefined;
   }
-  settle(hash: string, i: LightningInvoice, webhookEvent?: { id: string; tenantId: string; paymentIntentId: string; type: string; payload: string; createdAt: string }) {
+  settle(hash: string, i: LightningInvoice) {
     this.db.exec("BEGIN IMMEDIATE");
     try {
+      const now = new Date().toISOString()
+      const toStatus = canonicalStatus(i.state)
+      const allowedFrom = toStatus === 'succeeded'
+        ? ['requires_payment', 'processing']
+        : toStatus === 'processing'
+          ? ['requires_payment']
+          : toStatus === 'expired' || toStatus === 'canceled'
+            ? ['requires_payment', 'processing']
+            : []
+      const mapping = this.db.prepare(`
+        SELECT tenant_id tenantId, payment_intent_id paymentIntentId
+        FROM legacy_checkout_mappings
+        WHERE checkout_session_id=(
+          SELECT id FROM checkout_sessions WHERE payment_hash=?
+        )
+      `).get(hash) as { tenantId: string; paymentIntentId: string } | undefined
+      let canonicalChanged = false
+      if (mapping && allowedFrom.length > 0) {
+        const placeholders = allowedFrom.map(() => '?').join(',')
+        const changed = this.db.prepare(`
+          UPDATE payment_intents
+          SET status=?, settled_at=?, updated_at=?
+          WHERE tenant_id=? AND id=? AND status IN (${placeholders})
+        `).run(
+          toStatus,
+          toStatus === 'succeeded' ? i.settledAt ?? now : null,
+          now,
+          mapping.tenantId,
+          mapping.paymentIntentId,
+          ...allowedFrom,
+        ) as { changes: number }
+        canonicalChanged = changed.changes === 1
+      }
+
+      if (mapping && !canonicalChanged) {
+        this.db.exec('COMMIT')
+        return
+      }
       this.db
         .prepare(
           "UPDATE lightning_invoices SET state=?,settled_at=?,provider_settle_index=? WHERE payment_hash=?",
@@ -120,10 +265,37 @@ export class Repository {
           )
           .run(i.settledAt ?? new Date().toISOString(), hash);
           
-      if (webhookEvent) {
-        this.db
-          .prepare('INSERT INTO webhook_events (id, tenant_id, payment_intent_id, type, payload, created_at) VALUES (?,?,?,?,?,?) ON CONFLICT DO NOTHING')
-          .run(webhookEvent.id, webhookEvent.tenantId, webhookEvent.paymentIntentId, webhookEvent.type, webhookEvent.payload, webhookEvent.createdAt);
+      if (mapping && toStatus === 'succeeded') {
+        const eventId = stableLegacyId('evt_legacy_succeeded', mapping.paymentIntentId)
+        const payload = JSON.stringify({
+          id: mapping.paymentIntentId,
+          object: 'payment_intent',
+          status: 'succeeded',
+          paymentHash: hash,
+          settledAt: i.settledAt ?? now,
+        })
+        const event = this.db.prepare(`
+          INSERT OR IGNORE INTO webhook_events
+            (id, tenant_id, payment_intent_id, type, payload, created_at)
+          VALUES (?, ?, ?, 'payment_intent.succeeded', ?, ?)
+        `).run(eventId, mapping.tenantId, mapping.paymentIntentId, payload, now) as {
+          changes: number
+        }
+        const webhook = this.db.prepare(`
+          SELECT webhook_url webhookUrl, webhook_secret webhookSecret
+          FROM tenants WHERE id=?
+        `).get(mapping.tenantId) as {
+          webhookUrl: string | null
+          webhookSecret: string | null
+        }
+        if (event.changes === 1 && webhook.webhookUrl && webhook.webhookSecret) {
+          this.db.prepare(`
+            INSERT INTO webhook_deliveries
+              (id, event_id, tenant_id, status, attempt_count, last_attempt_at,
+               next_attempt_at, delivered_at, created_at)
+            VALUES (?, ?, ?, 'pending', 0, NULL, ?, NULL, ?)
+          `).run(stableLegacyId('wd_legacy', eventId), eventId, mapping.tenantId, now, now)
+        }
       }
       this.db.exec("COMMIT");
     } catch (e) {

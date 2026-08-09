@@ -111,6 +111,7 @@ export async function buildServer(
     config.DATABASE_URL,
     intentSecretCipher,
     config.SQLITE_BUSY_TIMEOUT_MS,
+    config.DATABASE_BACKUP_DIR,
   )
   if (paymentIntentRepo.tenantCount() === 0 && !config.BOOTSTRAP_KEY_PATH) {
     paymentIntentRepo.close()
@@ -118,8 +119,13 @@ export async function buildServer(
       'BOOTSTRAP_KEY_PATH is required when initializing an empty merchant database',
     )
   }
-  const legacyRepo = new Repository(config.DATABASE_URL)
-  const webhookRepo = new WebhookRepository(config.DATABASE_URL)
+  const databaseOptions = {
+    busyTimeoutMs: config.SQLITE_BUSY_TIMEOUT_MS,
+    backupDirectory: config.DATABASE_BACKUP_DIR,
+    intentSecretCipher,
+  }
+  const legacyRepo = new Repository(config.DATABASE_URL, databaseOptions)
+  const webhookRepo = new WebhookRepository(config.DATABASE_URL, databaseOptions)
   const apiKeyService = new ApiKeyService(paymentIntentRepo)
   const tenantService = new TenantService(paymentIntentRepo, apiKeyService)
   const webhookService = new WebhookService(webhookRepo, paymentIntentRepo)

@@ -5,7 +5,6 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { PaymentIntentSecretCipher } from '../src/security/payment-intent-secret-cipher.js'
-import { TenantRepository } from '../src/persistence/tenant-repository.js'
 import { PaymentIntentRepository } from '../src/persistence/payment-intent-repository.js'
 
 const KEY_A = Buffer.alloc(32, 0xa1).toString('base64')
@@ -57,22 +56,35 @@ test('legacy plaintext rows migrate transactionally and their SQLite pages are s
   const now = new Date().toISOString()
 
   try {
-    const tenantRepo = new TenantRepository(databaseUrl)
-    tenantRepo.createTenant({
-      id: tenantId,
-      name: 'Migration Merchant',
-      disabled: false,
-      webhookUrl: null,
-      webhookSecret: null,
-      prevWebhookSecret: null,
-      secretRotatedAt: null,
-      createdAt: now,
-      updatedAt: now,
-    })
-    tenantRepo.close()
-
     const legacy = new DatabaseSync(databasePath)
     legacy.exec(`
+      PRAGMA secure_delete=ON;
+      CREATE TABLE schema_migrations (
+        version INTEGER PRIMARY KEY,
+        applied_at TEXT NOT NULL
+      );
+      INSERT INTO schema_migrations VALUES (1, '${now}');
+      CREATE TABLE tenants (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL, disabled INTEGER NOT NULL,
+        webhook_url TEXT, webhook_secret TEXT, prev_webhook_secret TEXT,
+        secret_rotated_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
+      CREATE TABLE merchant_api_keys (
+        id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL REFERENCES tenants(id),
+        key_hash TEXT NOT NULL UNIQUE, key_prefix TEXT NOT NULL, label TEXT NOT NULL,
+        created_at TEXT NOT NULL, revoked_at TEXT
+      );
+      CREATE TABLE pricing_rules (
+        id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL REFERENCES tenants(id),
+        product_id TEXT NOT NULL, name TEXT NOT NULL, description TEXT,
+        mode TEXT NOT NULL, price_sats TEXT, max_price_sats TEXT,
+        active INTEGER NOT NULL, max_quantity INTEGER NOT NULL,
+        offer_enabled INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        UNIQUE(tenant_id, product_id), UNIQUE(tenant_id, id)
+      );
+      INSERT INTO tenants VALUES (
+        '${tenantId}', 'Migration Merchant', 0, NULL, NULL, NULL, NULL, '${now}', '${now}'
+      );
       CREATE TABLE payment_intent_schema_migrations (
         version INTEGER PRIMARY KEY,
         applied_at TEXT NOT NULL
@@ -129,9 +141,13 @@ test('legacy plaintext rows migrate transactionally and their SQLite pages are s
     const versions = inspected
       .prepare('SELECT version FROM payment_intent_schema_migrations ORDER BY version')
       .all() as Array<{ version: number }>
+    const schemaVersion = inspected
+      .prepare('SELECT MAX(version) version FROM schema_migrations')
+      .get() as { version: number }
     inspected.close()
     assert.equal(columns.some(({ name }) => name === 'intent_secret'), false)
     assert.deepEqual(versions.map(({ version }) => version), [1, 2, 3])
+    assert.equal(schemaVersion.version, 5)
     assert.equal(readFileSync(databasePath).includes(Buffer.from(plaintext, 'utf8')), false)
   } finally {
     rmSync(directory, { recursive: true, force: true })

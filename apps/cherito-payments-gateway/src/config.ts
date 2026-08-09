@@ -27,6 +27,7 @@ const schema = z.object({
     .default(900),
   RATE_LIMIT_CREATE_INVOICE: z.coerce.number().int().positive().default(10),
   DATABASE_URL: z.string().default("file:./data/cherito-payments.db"),
+  DATABASE_BACKUP_DIR: z.string().optional(),
   CHERITO_INTENT_SECRET_KEY: z.string().min(1),
   CHERITO_INTENT_SECRET_PREVIOUS_KEYS: z.string().default(""),
   LOG_LEVEL: z

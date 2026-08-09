@@ -21,6 +21,8 @@ Website / Web Component --HTTPS--> Gateway --TLS + limited macaroon--> LND REST
   `e0b23440a3a3c259122d0aefc1a5f4fd928b323e`.
 
 Node 22.5+ is required because persistence uses the built-in `node:sqlite` API.
+See the [database recovery runbook](docs/database-recovery.md) for migration,
+backup, restore, and provider-reconciliation procedures.
 
 ## Install and develop
 

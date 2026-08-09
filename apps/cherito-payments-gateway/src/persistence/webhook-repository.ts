@@ -1,6 +1,8 @@
-import { DatabaseSync } from 'node:sqlite'
-import { mkdirSync } from 'node:fs'
-import { dirname } from 'node:path'
+import type { DatabaseSync } from 'node:sqlite'
+import {
+  openDatabase,
+  type DatabaseMigrationOptions,
+} from './database-lifecycle.js'
 
 export interface WebhookEvent {
   id: string
@@ -25,41 +27,11 @@ export interface WebhookDelivery {
   createdAt: string
 }
 
-const WEBHOOK_SCHEMA = `
-  PRAGMA journal_mode=WAL;
-  PRAGMA foreign_keys=ON;
-
-  CREATE TABLE IF NOT EXISTS webhook_events (
-    id TEXT PRIMARY KEY,
-    tenant_id TEXT NOT NULL,
-    payment_intent_id TEXT NOT NULL,
-    type TEXT NOT NULL,
-    payload TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    UNIQUE(tenant_id, payment_intent_id, type)
-  );
-
-  CREATE TABLE IF NOT EXISTS webhook_deliveries (
-    id TEXT PRIMARY KEY,
-    event_id TEXT NOT NULL REFERENCES webhook_events(id),
-    tenant_id TEXT NOT NULL,
-    status TEXT NOT NULL,
-    attempt_count INTEGER NOT NULL DEFAULT 0,
-    last_attempt_at TEXT,
-    next_attempt_at TEXT,
-    delivered_at TEXT,
-    created_at TEXT NOT NULL
-  );
-`
-
 export class WebhookRepository {
   protected db: DatabaseSync
 
-  constructor(url: string) {
-    const file = url.replace(/^file:/, '')
-    mkdirSync(dirname(file), { recursive: true })
-    this.db = new DatabaseSync(file)
-    this.db.exec(WEBHOOK_SCHEMA)
+  constructor(url: string, options: DatabaseMigrationOptions = {}) {
+    this.db = openDatabase(url, options)
   }
 
   createEvent(event: WebhookEvent): void {
@@ -141,13 +113,13 @@ export class WebhookRepository {
     }
   }
 
-  event(id: string): WebhookEvent | undefined {
-    const row = this.db.prepare('SELECT id, tenant_id tenantId, payment_intent_id paymentIntentId, type, payload, created_at createdAt FROM webhook_events WHERE id=?').get(id) as Record<string, unknown> | undefined
+  event(tenantId: string, id: string): WebhookEvent | undefined {
+    const row = this.db.prepare('SELECT id, tenant_id tenantId, payment_intent_id paymentIntentId, type, payload, created_at createdAt FROM webhook_events WHERE tenant_id=? AND id=?').get(tenantId, id) as Record<string, unknown> | undefined
     return row ? (row as unknown as WebhookEvent) : undefined
   }
 
-  delivery(id: string): WebhookDelivery | undefined {
-    const row = this.db.prepare('SELECT id, event_id eventId, tenant_id tenantId, status, attempt_count attemptCount, last_attempt_at lastAttemptAt, next_attempt_at nextAttemptAt, delivered_at deliveredAt, created_at createdAt FROM webhook_deliveries WHERE id=?').get(id) as Record<string, unknown> | undefined
+  delivery(tenantId: string, id: string): WebhookDelivery | undefined {
+    const row = this.db.prepare('SELECT id, event_id eventId, tenant_id tenantId, status, attempt_count attemptCount, last_attempt_at lastAttemptAt, next_attempt_at nextAttemptAt, delivered_at deliveredAt, created_at createdAt FROM webhook_deliveries WHERE tenant_id=? AND id=?').get(tenantId, id) as Record<string, unknown> | undefined
     return row ? (row as unknown as WebhookDelivery) : undefined
   }
 
@@ -162,23 +134,23 @@ export class WebhookRepository {
     return rows.map(r => r as unknown as WebhookDelivery)
   }
 
-  markDelivered(id: string): void {
+  markDelivered(tenantId: string, id: string): void {
     const now = new Date().toISOString()
     this.db
-      .prepare("UPDATE webhook_deliveries SET status='delivered', delivered_at=?, last_attempt_at=?, attempt_count = attempt_count + 1 WHERE id=?")
-      .run(now, now, id)
+      .prepare("UPDATE webhook_deliveries SET status='delivered', delivered_at=?, last_attempt_at=?, attempt_count = attempt_count + 1 WHERE tenant_id=? AND id=?")
+      .run(now, now, tenantId, id)
   }
 
-  markFailed(id: string, nextAttemptAt: string): void {
+  markFailed(tenantId: string, id: string, nextAttemptAt: string): void {
     this.db
-      .prepare("UPDATE webhook_deliveries SET status='failed', last_attempt_at=?, next_attempt_at=?, attempt_count = attempt_count + 1 WHERE id=?")
-      .run(new Date().toISOString(), nextAttemptAt, id)
+      .prepare("UPDATE webhook_deliveries SET status='failed', last_attempt_at=?, next_attempt_at=?, attempt_count = attempt_count + 1 WHERE tenant_id=? AND id=?")
+      .run(new Date().toISOString(), nextAttemptAt, tenantId, id)
   }
 
-  markPermanentlyFailed(id: string): void {
+  markPermanentlyFailed(tenantId: string, id: string): void {
     this.db
-      .prepare("UPDATE webhook_deliveries SET status='permanently_failed', last_attempt_at=?, next_attempt_at=NULL, attempt_count = attempt_count + 1 WHERE id=?")
-      .run(new Date().toISOString(), id)
+      .prepare("UPDATE webhook_deliveries SET status='permanently_failed', last_attempt_at=?, next_attempt_at=NULL, attempt_count = attempt_count + 1 WHERE tenant_id=? AND id=?")
+      .run(new Date().toISOString(), tenantId, id)
   }
 
   close(): void {

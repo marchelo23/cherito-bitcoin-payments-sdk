@@ -44,6 +44,15 @@ export interface PaymentIntentTransition {
   invoice?: LightningInvoice
   settledAt?: string | null
   updatedAt: string
+  event?: DurablePaymentIntentEvent
+}
+
+export interface DurablePaymentIntentEvent {
+  id: string
+  deliveryId: string
+  type: string
+  payload: string
+  createdAt: string
 }
 
 interface StoredPaymentIntent extends Omit<PaymentIntent, 'intentSecret'> {
@@ -52,30 +61,6 @@ interface StoredPaymentIntent extends Omit<PaymentIntent, 'intentSecret'> {
   intentSecretNonce: string
   intentSecretCiphertext: string
   intentSecretAuthTag: string
-}
-
-interface LegacyStoredPaymentIntent {
-  id: string
-  tenant_id: string
-  merchant_order_id: string | null
-  pricing_rule_id: string | null
-  payment_link_id: string | null
-  amount_sats: string
-  currency: string
-  description: string
-  metadata: string | null
-  status: string
-  payment_request: string
-  payment_hash: string
-  provider_invoice_id: string
-  intent_secret: string
-  client_secret_hash: string
-  idempotency_key: string | null
-  idempotency_payload_hash: string | null
-  expires_at: string
-  settled_at: string | null
-  created_at: string
-  updated_at: string
 }
 
 const PAYMENT_INTENT_COLUMNS = `
@@ -106,55 +91,6 @@ const PAYMENT_INTENT_COLUMNS = `
   updated_at updatedAt
 `
 
-const PAYMENT_INTENT_MIGRATIONS = [
-  {
-    version: 1,
-    sql: `
-      CREATE TABLE IF NOT EXISTS payment_intents (
-        id                       TEXT PRIMARY KEY,
-        tenant_id                TEXT NOT NULL REFERENCES tenants(id),
-        merchant_order_id        TEXT,
-        pricing_rule_id          TEXT REFERENCES pricing_rules(id),
-        payment_link_id          TEXT,
-        amount_sats              TEXT NOT NULL,
-        currency                 TEXT NOT NULL DEFAULT 'SAT' CHECK (currency = 'SAT'),
-        description              TEXT NOT NULL,
-        metadata                 TEXT,
-        status                   TEXT NOT NULL,
-        payment_request          TEXT NOT NULL,
-        payment_hash             TEXT NOT NULL UNIQUE,
-        provider_invoice_id      TEXT NOT NULL UNIQUE,
-        intent_secret_version    INTEGER NOT NULL,
-        intent_secret_key_id     TEXT NOT NULL,
-        intent_secret_nonce      TEXT NOT NULL,
-        intent_secret_ciphertext TEXT NOT NULL,
-        intent_secret_auth_tag   TEXT NOT NULL,
-        client_secret_hash       TEXT NOT NULL,
-        idempotency_key          TEXT,
-        idempotency_payload_hash TEXT,
-        expires_at               TEXT NOT NULL,
-        settled_at               TEXT,
-        created_at               TEXT NOT NULL,
-        updated_at               TEXT NOT NULL
-      );
-
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_intents_tenant_idempotency
-        ON payment_intents(tenant_id, idempotency_key)
-        WHERE idempotency_key IS NOT NULL;
-
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_intents_tenant_order
-        ON payment_intents(tenant_id, merchant_order_id)
-        WHERE merchant_order_id IS NOT NULL;
-
-      CREATE INDEX IF NOT EXISTS idx_payment_intents_recovery
-        ON payment_intents(status, expires_at);
-
-      CREATE INDEX IF NOT EXISTS idx_payment_intents_tenant_created
-        ON payment_intents(tenant_id, created_at);
-    `,
-  },
-] as const
-
 /**
  * Payment Intent persistence extends the existing tenant repository so tenant,
  * pricing-rule and intent writes share one SQLite connection and transaction
@@ -165,14 +101,10 @@ export class PaymentIntentRepository extends TenantRepository {
     url: string,
     private readonly intentSecretCipher: PaymentIntentSecretCipher,
     busyTimeoutMs = 5_000,
+    backupDirectory?: string,
   ) {
-    super(url)
+    super(url, { intentSecretCipher, busyTimeoutMs, backupDirectory })
     try {
-      this.db.exec(`
-        PRAGMA busy_timeout=${Math.max(0, Math.trunc(busyTimeoutMs))};
-        PRAGMA secure_delete=ON;
-      `)
-      this.applyPaymentIntentMigrations()
       this.rewrapIntentSecretsWithActiveKey()
     } catch (error) {
       this.db.close()
@@ -181,7 +113,9 @@ export class PaymentIntentRepository extends TenantRepository {
   }
 
   tenantCount(): number {
-    const row = this.db.prepare('SELECT COUNT(*) count FROM tenants').get() as { count: number }
+    const row = this.db
+      .prepare("SELECT COUNT(*) count FROM tenants WHERE id!='legacy'")
+      .get() as { count: number }
     return row.count
   }
 
@@ -290,57 +224,39 @@ export class PaymentIntentRepository extends TenantRepository {
     const settledAt = transition.toStatus === 'succeeded'
       ? (transition.invoice?.settledAt ?? transition.settledAt ?? transition.updatedAt)
       : null
-    const result = this.db
-      .prepare(
-        `UPDATE payment_intents
-         SET status=?, settled_at=?, updated_at=?
-         WHERE tenant_id=? AND payment_hash=? AND status=?`,
-      )
-      .run(
-        transition.toStatus,
-        settledAt,
-        transition.updatedAt,
-        transition.tenantId,
-        transition.paymentHash,
-        transition.fromStatus,
-      ) as { changes: number }
-    return result.changes === 1
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const result = this.db
+        .prepare(
+          `UPDATE payment_intents
+           SET status=?, settled_at=?, updated_at=?
+           WHERE tenant_id=? AND payment_hash=? AND status=?`,
+        )
+        .run(
+          transition.toStatus,
+          settledAt,
+          transition.updatedAt,
+          transition.tenantId,
+          transition.paymentHash,
+          transition.fromStatus,
+        ) as { changes: number }
+      if (result.changes !== 1) {
+        this.db.exec('ROLLBACK')
+        return false
+      }
+
+      this.synchronizeLegacyPayment(transition, settledAt)
+      if (transition.event) this.persistTransitionEvent(transition, transition.event)
+      this.db.exec('COMMIT')
+      return true
+    } catch (error) {
+      if (this.db.isTransaction) this.db.exec('ROLLBACK')
+      throw error
+    }
   }
 
   close(): void {
     this.db.close()
-  }
-
-  private applyPaymentIntentMigrations(): void {
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS payment_intent_schema_migrations (
-        version INTEGER PRIMARY KEY,
-        applied_at TEXT NOT NULL
-      )
-    `)
-    const applied = new Set(
-      (this.db
-        .prepare('SELECT version FROM payment_intent_schema_migrations')
-        .all() as Array<{ version: number }>).map(({ version }) => version),
-    )
-
-    for (const migration of PAYMENT_INTENT_MIGRATIONS) {
-      if (applied.has(migration.version)) continue
-      this.db.exec('BEGIN IMMEDIATE')
-      try {
-        this.db.exec(migration.sql)
-        this.db
-          .prepare('INSERT INTO payment_intent_schema_migrations VALUES (?, ?)')
-          .run(migration.version, new Date().toISOString())
-        this.db.exec('COMMIT')
-      } catch (error) {
-        this.db.exec('ROLLBACK')
-        throw error
-      }
-    }
-
-    if (!applied.has(2)) this.migratePlaintextIntentSecrets()
-    if (!applied.has(3)) this.secureEraseLegacyPages()
   }
 
   private materialize(row: StoredPaymentIntent): PaymentIntent {
@@ -376,119 +292,87 @@ export class PaymentIntentRepository extends TenantRepository {
     }
   }
 
-  private migratePlaintextIntentSecrets(): void {
-    const columns = this.db.prepare('PRAGMA table_info(payment_intents)').all() as Array<{
-      name: string
-    }>
-    if (!columns.some(({ name }) => name === 'intent_secret')) {
-      this.db
-        .prepare('INSERT INTO payment_intent_schema_migrations VALUES (?, ?)')
-        .run(2, new Date().toISOString())
-      return
+  private persistTransitionEvent(
+    transition: PaymentIntentTransition,
+    event: DurablePaymentIntentEvent,
+  ): void {
+    const intent = this.db.prepare(`
+      SELECT id FROM payment_intents WHERE tenant_id=? AND payment_hash=?
+    `).get(transition.tenantId, transition.paymentHash) as { id: string }
+    const inserted = this.db.prepare(`
+      INSERT OR IGNORE INTO webhook_events
+        (id, tenant_id, payment_intent_id, type, payload, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(
+      event.id,
+      transition.tenantId,
+      intent.id,
+      event.type,
+      event.payload,
+      event.createdAt,
+    ) as { changes: number }
+    if (inserted.changes !== 1) return
+
+    const webhook = this.db.prepare(`
+      SELECT webhook_url webhookUrl, webhook_secret webhookSecret
+      FROM tenants WHERE id=?
+    `).get(transition.tenantId) as {
+      webhookUrl: string | null
+      webhookSecret: string | null
     }
+    if (!webhook.webhookUrl || !webhook.webhookSecret) return
+    this.db.prepare(`
+      INSERT INTO webhook_deliveries
+        (id, event_id, tenant_id, status, attempt_count, last_attempt_at,
+         next_attempt_at, delivered_at, created_at)
+      VALUES (?, ?, ?, 'pending', 0, NULL, ?, NULL, ?)
+    `).run(
+      event.deliveryId,
+      event.id,
+      transition.tenantId,
+      event.createdAt,
+      event.createdAt,
+    )
+  }
 
-    this.db.exec('BEGIN IMMEDIATE')
-    try {
-      this.db.exec(`
-        CREATE TABLE payment_intents_encrypted (
-          id                       TEXT PRIMARY KEY,
-          tenant_id                TEXT NOT NULL REFERENCES tenants(id),
-          merchant_order_id        TEXT,
-          pricing_rule_id          TEXT REFERENCES pricing_rules(id),
-          payment_link_id          TEXT,
-          amount_sats              TEXT NOT NULL,
-          currency                 TEXT NOT NULL DEFAULT 'SAT' CHECK (currency = 'SAT'),
-          description              TEXT NOT NULL,
-          metadata                 TEXT,
-          status                   TEXT NOT NULL,
-          payment_request          TEXT NOT NULL,
-          payment_hash             TEXT NOT NULL UNIQUE,
-          provider_invoice_id      TEXT NOT NULL UNIQUE,
-          intent_secret_version    INTEGER NOT NULL,
-          intent_secret_key_id     TEXT NOT NULL,
-          intent_secret_nonce      TEXT NOT NULL,
-          intent_secret_ciphertext TEXT NOT NULL,
-          intent_secret_auth_tag   TEXT NOT NULL,
-          client_secret_hash       TEXT NOT NULL,
-          idempotency_key          TEXT,
-          idempotency_payload_hash TEXT,
-          expires_at               TEXT NOT NULL,
-          settled_at               TEXT,
-          created_at               TEXT NOT NULL,
-          updated_at               TEXT NOT NULL
-        )
-      `)
+  private synchronizeLegacyPayment(
+    transition: PaymentIntentTransition,
+    settledAt: string | null,
+  ): void {
+    const mapping = this.db.prepare(`
+      SELECT m.checkout_session_id checkoutSessionId, m.order_id orderId
+      FROM legacy_checkout_mappings m
+      JOIN payment_intents p
+        ON p.tenant_id=m.tenant_id AND p.id=m.payment_intent_id
+      WHERE p.tenant_id=? AND p.payment_hash=?
+    `).get(transition.tenantId, transition.paymentHash) as {
+      checkoutSessionId: string
+      orderId: string
+    } | undefined
+    if (!mapping) return
 
-      const legacyRows = this.db
-        .prepare('SELECT * FROM payment_intents')
-        .all() as unknown as LegacyStoredPaymentIntent[]
-      const insert = this.db.prepare(`
-        INSERT INTO payment_intents_encrypted (
-          id, tenant_id, merchant_order_id, pricing_rule_id, payment_link_id,
-          amount_sats, currency, description, metadata, status,
-          payment_request, payment_hash, provider_invoice_id,
-          intent_secret_version, intent_secret_key_id, intent_secret_nonce,
-          intent_secret_ciphertext, intent_secret_auth_tag,
-          client_secret_hash, idempotency_key, idempotency_payload_hash,
-          expires_at, settled_at, created_at, updated_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-      `)
-      for (const row of legacyRows) {
-        const encrypted = this.intentSecretCipher.encrypt(row.intent_secret, row.tenant_id, row.id)
-        insert.run(
-          row.id,
-          row.tenant_id,
-          row.merchant_order_id,
-          row.pricing_rule_id,
-          row.payment_link_id,
-          row.amount_sats,
-          row.currency,
-          row.description,
-          row.metadata,
-          row.status,
-          row.payment_request,
-          row.payment_hash,
-          row.provider_invoice_id,
-          encrypted.version,
-          encrypted.keyId,
-          encrypted.nonce,
-          encrypted.ciphertext,
-          encrypted.authTag,
-          row.client_secret_hash,
-          row.idempotency_key,
-          row.idempotency_payload_hash,
-          row.expires_at,
-          row.settled_at,
-          row.created_at,
-          row.updated_at,
-        )
-      }
-
-      this.db.exec(`
-        DROP TABLE payment_intents;
-        ALTER TABLE payment_intents_encrypted RENAME TO payment_intents;
-
-        CREATE UNIQUE INDEX idx_payment_intents_tenant_idempotency
-          ON payment_intents(tenant_id, idempotency_key)
-          WHERE idempotency_key IS NOT NULL;
-
-        CREATE UNIQUE INDEX idx_payment_intents_tenant_order
-          ON payment_intents(tenant_id, merchant_order_id)
-          WHERE merchant_order_id IS NOT NULL;
-
-        CREATE INDEX idx_payment_intents_recovery
-          ON payment_intents(status, expires_at);
-
-        CREATE INDEX idx_payment_intents_tenant_created
-          ON payment_intents(tenant_id, created_at);
-      `)
-      this.db
-        .prepare('INSERT INTO payment_intent_schema_migrations VALUES (?, ?)')
-        .run(2, new Date().toISOString())
-      this.db.exec('COMMIT')
-    } catch (error) {
-      this.db.exec('ROLLBACK')
-      throw error
+    const legacyState = transition.toStatus === 'succeeded'
+      ? 'settled'
+      : transition.toStatus === 'processing'
+        ? 'accepted'
+        : transition.toStatus
+    this.db.prepare(`
+      UPDATE lightning_invoices SET state=?, settled_at=COALESCE(?, settled_at),
+        provider_settle_index=COALESCE(?, provider_settle_index)
+      WHERE payment_hash=?
+    `).run(
+      legacyState,
+      settledAt,
+      transition.invoice?.providerSettleIndex ?? null,
+      transition.paymentHash,
+    )
+    this.db.prepare('UPDATE checkout_sessions SET state=? WHERE id=?')
+      .run(legacyState, mapping.checkoutSessionId)
+    if (transition.toStatus === 'succeeded') {
+      this.db.prepare(`
+        UPDATE orders SET state='confirmed', confirmed_at=COALESCE(confirmed_at, ?)
+        WHERE id=? AND state!='confirmed'
+      `).run(settledAt ?? transition.updatedAt, mapping.orderId)
     }
   }
 
@@ -535,14 +419,4 @@ export class PaymentIntentRepository extends TenantRepository {
     }
   }
 
-  private secureEraseLegacyPages(): void {
-    // Dropping a SQLite column does not itself guarantee that its old bytes are
-    // absent from free pages or the WAL. Scrub both before recording completion.
-    this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
-    this.db.exec('VACUUM')
-    this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
-    this.db
-      .prepare('INSERT INTO payment_intent_schema_migrations VALUES (?, ?)')
-      .run(3, new Date().toISOString())
-  }
 }

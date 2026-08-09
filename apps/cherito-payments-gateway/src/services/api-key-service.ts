@@ -1,5 +1,5 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
-import type { Repository, MerchantApiKey } from '../persistence/repository.js'
+import type { TenantRepository, MerchantApiKey } from '../persistence/tenant-repository.js'
 
 /**
  * API key format: sk_live_<32 random bytes base64url>
@@ -12,7 +12,7 @@ import type { Repository, MerchantApiKey } from '../persistence/repository.js'
  * - Revoked keys are rejected before tenant lookup
  */
 export class ApiKeyService {
-  constructor(private readonly repo: Repository) {}
+  constructor(private readonly repo: TenantRepository) {}
 
   /**
    * Generate a new merchant API key for the given tenant.
@@ -58,8 +58,8 @@ export class ApiKeyService {
     return { tenantId: record.tenantId, keyId: record.id }
   }
 
-  revoke(keyId: string): void {
-    this.repo.revokeApiKey(keyId)
+  revoke(keyId: string, tenantId: string): void {
+    this.repo.revokeApiKey(keyId, tenantId)
   }
 
   private hashKey(raw: string): string {

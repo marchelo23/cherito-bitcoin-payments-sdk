@@ -40,7 +40,7 @@ describe('TenantRepository — low-level isolation', () => {
   test('createTenant and tenant() roundtrip', () => {
     const repo = makeRepo()
     const now = new Date().toISOString()
-    repo.createTenant({ id: 'tnt_a', name: 'Alpha', disabled: false, createdAt: now, updatedAt: now })
+    repo.createTenant({ id: 'tnt_a', name: 'Alpha', disabled: false, webhookUrl: null, webhookSecret: null, prevWebhookSecret: null, secretRotatedAt: null, createdAt: now, updatedAt: now })
     const t = repo.tenant('tnt_a')
     assert.equal(t?.name, 'Alpha')
     assert.equal(t?.disabled, false)
@@ -54,7 +54,7 @@ describe('TenantRepository — low-level isolation', () => {
   test('disableTenant marks it as disabled', () => {
     const repo = makeRepo()
     const now = new Date().toISOString()
-    repo.createTenant({ id: 'tnt_b', name: 'Beta', disabled: false, createdAt: now, updatedAt: now })
+    repo.createTenant({ id: 'tnt_b', name: 'Beta', disabled: false, webhookUrl: null, webhookSecret: null, prevWebhookSecret: null, secretRotatedAt: null, createdAt: now, updatedAt: now })
     repo.disableTenant('tnt_b')
     assert.equal(repo.tenant('tnt_b')?.disabled, true)
   })
@@ -62,7 +62,7 @@ describe('TenantRepository — low-level isolation', () => {
   test('enableTenant re-enables a disabled tenant', () => {
     const repo = makeRepo()
     const now = new Date().toISOString()
-    repo.createTenant({ id: 'tnt_c', name: 'Gamma', disabled: true, createdAt: now, updatedAt: now })
+    repo.createTenant({ id: 'tnt_c', name: 'Gamma', disabled: true, webhookUrl: null, webhookSecret: null, prevWebhookSecret: null, secretRotatedAt: null, createdAt: now, updatedAt: now })
     repo.enableTenant('tnt_c')
     assert.equal(repo.tenant('tnt_c')?.disabled, false)
   })
@@ -70,8 +70,8 @@ describe('TenantRepository — low-level isolation', () => {
   test('pricingRule() is strictly tenant-scoped — cross-tenant lookup returns undefined', () => {
     const repo = makeRepo()
     const now = new Date().toISOString()
-    repo.createTenant({ id: 'tnt_x', name: 'X', disabled: false, createdAt: now, updatedAt: now })
-    repo.createTenant({ id: 'tnt_y', name: 'Y', disabled: false, createdAt: now, updatedAt: now })
+    repo.createTenant({ id: 'tnt_x', name: 'X', disabled: false, webhookUrl: null, webhookSecret: null, prevWebhookSecret: null, secretRotatedAt: null, createdAt: now, updatedAt: now })
+    repo.createTenant({ id: 'tnt_y', name: 'Y', disabled: false, webhookUrl: null, webhookSecret: null, prevWebhookSecret: null, secretRotatedAt: null, createdAt: now, updatedAt: now })
 
     repo.upsertPricingRule({
       id: 'pr_1',
@@ -98,8 +98,8 @@ describe('TenantRepository — low-level isolation', () => {
   test('same productId can exist for two tenants independently', () => {
     const repo = makeRepo()
     const now = new Date().toISOString()
-    repo.createTenant({ id: 'tnt_p', name: 'P', disabled: false, createdAt: now, updatedAt: now })
-    repo.createTenant({ id: 'tnt_q', name: 'Q', disabled: false, createdAt: now, updatedAt: now })
+    repo.createTenant({ id: 'tnt_p', name: 'P', disabled: false, webhookUrl: null, webhookSecret: null, prevWebhookSecret: null, secretRotatedAt: null, createdAt: now, updatedAt: now })
+    repo.createTenant({ id: 'tnt_q', name: 'Q', disabled: false, webhookUrl: null, webhookSecret: null, prevWebhookSecret: null, secretRotatedAt: null, createdAt: now, updatedAt: now })
 
     repo.upsertPricingRule({
       id: 'pr_p1', tenantId: 'tnt_p', productId: 'widget',
@@ -126,7 +126,7 @@ describe('TenantRepository — low-level isolation', () => {
   test('upsertPricingRule updates existing record without duplicating', () => {
     const repo = makeRepo()
     const now = new Date().toISOString()
-    repo.createTenant({ id: 'tnt_up', name: 'Up', disabled: false, createdAt: now, updatedAt: now })
+    repo.createTenant({ id: 'tnt_up', name: 'Up', disabled: false, webhookUrl: null, webhookSecret: null, prevWebhookSecret: null, secretRotatedAt: null, createdAt: now, updatedAt: now })
 
     const base = {
       id: 'pr_up1', tenantId: 'tnt_up', productId: 'latte',
@@ -149,8 +149,8 @@ describe('TenantRepository — low-level isolation', () => {
   test('revokeApiKey is tenant-scoped: cannot revoke another tenant key', () => {
     const repo = makeRepo()
     const now = new Date().toISOString()
-    repo.createTenant({ id: 'tnt_a2', name: 'A2', disabled: false, createdAt: now, updatedAt: now })
-    repo.createTenant({ id: 'tnt_b2', name: 'B2', disabled: false, createdAt: now, updatedAt: now })
+    repo.createTenant({ id: 'tnt_a2', name: 'A2', disabled: false, webhookUrl: null, webhookSecret: null, prevWebhookSecret: null, secretRotatedAt: null, createdAt: now, updatedAt: now })
+    repo.createTenant({ id: 'tnt_b2', name: 'B2', disabled: false, webhookUrl: null, webhookSecret: null, prevWebhookSecret: null, secretRotatedAt: null, createdAt: now, updatedAt: now })
 
     repo.createApiKey({
       id: 'mak_a2', tenantId: 'tnt_a2', keyHash: 'hash_a', keyPrefix: 'sk_live_aa',
@@ -205,8 +205,7 @@ describe('TenantService — validation and lifecycle', () => {
     assert.ok(result.apiKey.startsWith('sk_live_'), 'API key must be sk_live_ prefixed')
     assert.ok(result.apiKeyRecord.id.startsWith('mak_'))
     assert.equal(result.apiKeyRecord.tenantId, result.tenant.id)
-    // Webhook secret must NOT be auto-generated at tenant creation
-    assert.equal('webhookSecret' in result.tenant, false)
+    assert.equal(result.tenant.webhookSecret, null)
   })
 
   test('assertActive throws for non-existent tenant', () => {

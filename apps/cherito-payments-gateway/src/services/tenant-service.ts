@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { randomUUID, randomBytes } from 'node:crypto'
 import { z } from 'zod'
 import type { TenantRepository, Tenant, PricingRule, MerchantApiKey } from '../persistence/tenant-repository.js'
 import type { ApiKeyService } from './api-key-service.js'
@@ -128,6 +128,10 @@ export class TenantService {
       id: `tnt_${randomUUID()}`,
       name: parsed.name,
       disabled: false,
+      webhookUrl: null,
+      webhookSecret: null,
+      prevWebhookSecret: null,
+      secretRotatedAt: null,
       createdAt: now,
       updatedAt: now,
     }
@@ -239,5 +243,20 @@ export class TenantService {
 
   revokeApiKey(tenantId: string, keyId: string): void {
     this.repo.revokeApiKey(keyId, tenantId)
+  }
+
+  // ---- Webhook Configuration -----------------------------------------------
+
+  configureWebhookUrl(tenantId: string, url: string | null): Tenant {
+    const t = this.assertActive(tenantId)
+    this.repo.updateWebhookConfig(tenantId, url, t.webhookSecret, t.prevWebhookSecret, t.secretRotatedAt)
+    return this.repo.tenant(tenantId)!
+  }
+
+  rotateWebhookSecret(tenantId: string): Tenant {
+    const t = this.assertActive(tenantId)
+    const newSecret = randomBytes(32).toString('hex')
+    this.repo.updateWebhookConfig(tenantId, t.webhookUrl, newSecret, t.webhookSecret, new Date().toISOString())
+    return this.repo.tenant(tenantId)!
   }
 }

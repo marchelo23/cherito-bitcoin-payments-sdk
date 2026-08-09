@@ -13,6 +13,10 @@ export interface Tenant {
   name: string
   /** If true the tenant is suspended and cannot create new invoices */
   disabled: boolean
+  webhookUrl: string | null
+  webhookSecret: string | null
+  prevWebhookSecret: string | null
+  secretRotatedAt: string | null
   createdAt: string
   updatedAt: string
 }
@@ -65,11 +69,15 @@ const TENANT_SCHEMA = `
   );
 
   CREATE TABLE IF NOT EXISTS tenants (
-    id          TEXT PRIMARY KEY,
-    name        TEXT NOT NULL,
-    disabled    INTEGER NOT NULL DEFAULT 0,
-    created_at  TEXT NOT NULL,
-    updated_at  TEXT NOT NULL
+    id            TEXT PRIMARY KEY,
+    name          TEXT NOT NULL,
+    disabled      INTEGER NOT NULL DEFAULT 0,
+    webhook_url   TEXT,
+    webhook_secret TEXT,
+    prev_webhook_secret TEXT,
+    secret_rotated_at TEXT,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
   );
 
   CREATE TABLE IF NOT EXISTS merchant_api_keys (
@@ -119,14 +127,14 @@ export class TenantRepository {
 
   createTenant(tenant: Tenant): void {
     this.db
-      .prepare('INSERT INTO tenants VALUES (?,?,?,?,?)')
-      .run(tenant.id, tenant.name, tenant.disabled ? 1 : 0, tenant.createdAt, tenant.updatedAt)
+      .prepare('INSERT INTO tenants (id, name, disabled, webhook_url, webhook_secret, prev_webhook_secret, secret_rotated_at, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)')
+      .run(tenant.id, tenant.name, tenant.disabled ? 1 : 0, tenant.webhookUrl, tenant.webhookSecret, tenant.prevWebhookSecret, tenant.secretRotatedAt, tenant.createdAt, tenant.updatedAt)
   }
 
   tenant(id: string): Tenant | undefined {
     const row = this.db
       .prepare(
-        `SELECT id, name, disabled, created_at createdAt, updated_at updatedAt
+        `SELECT id, name, disabled, webhook_url webhookUrl, webhook_secret webhookSecret, prev_webhook_secret prevWebhookSecret, secret_rotated_at secretRotatedAt, created_at createdAt, updated_at updatedAt
          FROM tenants WHERE id=?`,
       )
       .get(id) as Record<string, unknown> | undefined
@@ -144,6 +152,12 @@ export class TenantRepository {
     this.db
       .prepare(`UPDATE tenants SET disabled=0, updated_at=? WHERE id=?`)
       .run(new Date().toISOString(), id)
+  }
+
+  updateWebhookConfig(id: string, url: string | null, secret: string | null, prevSecret: string | null, rotatedAt: string | null): void {
+    this.db
+      .prepare(`UPDATE tenants SET webhook_url=?, webhook_secret=?, prev_webhook_secret=?, secret_rotated_at=?, updated_at=? WHERE id=?`)
+      .run(url, secret, prevSecret, rotatedAt, new Date().toISOString(), id)
   }
 
   // ---- API Keys (tenant-scoped) --------------------------------------------

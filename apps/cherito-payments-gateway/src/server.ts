@@ -1,4 +1,4 @@
-import Fastify, { type FastifyInstance } from 'fastify'
+import Fastify, { LogController, type FastifyInstance } from 'fastify'
 import cors from '@fastify/cors'
 import { z } from 'zod'
 import { writeFile } from 'node:fs/promises'
@@ -23,6 +23,13 @@ import { TenantService } from './services/tenant-service.js'
 import { WebhookService } from './services/webhook-service.js'
 import { LndkProvider } from './services/lndk-provider.js'
 import { PaymentIntentSecretCipher } from './security/payment-intent-secret-cipher.js'
+import {
+  createSafeLoggerOptions,
+  safeLog,
+  writeSafeProcessEvent,
+  type LogDestination,
+  type SafeLogger,
+} from './logging/safe-logger.js'
 
 const PRODUCT_ID = /^[a-z0-9][a-z0-9-]{1,78}[a-z0-9]$/
 const TENANT_ID = /^tnt_[0-9a-f-]{36}$/
@@ -62,16 +69,73 @@ const offerBody = z.object({ productId: z.string().regex(/^[a-z0-9-]{3,80}$/) })
 const extractBearer = (header: unknown): string =>
   typeof header === 'string' ? header.replace(/^Bearer\s+/i, '') : ''
 
+const PUBLIC_ERROR_MESSAGES: Readonly<Record<string, string>> = {
+  AMOUNT_OUT_OF_RANGE: 'Amount is outside configured limits',
+  BOLT12_NOT_CONFIGURED: 'BOLT12 receive is not configured',
+  IDEMPOTENCY_CONFLICT: 'Idempotency key payload conflict',
+  INVALID_AMOUNT: 'Amount must be a positive integer',
+  INVALID_DESCRIPTION: 'Description is invalid',
+  DESCRIPTION_TOO_LARGE: 'Description is too large',
+  INVALID_IDEMPOTENCY_KEY: 'Idempotency key is invalid',
+  IDEMPOTENCYKEY_TOO_LARGE: 'Idempotency key is too large',
+  INVALID_AMOUNT_SOURCE: 'Exactly one amount source is required',
+  INVALID_MERCHANT_ORDER_ID: 'Merchant order ID is invalid',
+  MERCHANTORDERID_TOO_LARGE: 'Merchant order ID is too large',
+  MERCHANT_ORDER_CONFLICT: 'Merchant order ID is already in use',
+  INVALID_PRICING_RULE: 'Pricing rule configuration is invalid',
+  INVALID_QUANTITY: 'Quantity is invalid',
+  LNDK_UNAVAILABLE: 'Lightning provider unavailable',
+  METADATA_TOO_LARGE: 'Metadata is too large',
+  PRICING_RULE_NOT_FOUND: 'Pricing rule is unavailable',
+  PRODUCT_NOT_FOUND: 'Product is unavailable',
+  PROVIDER_AMOUNT_MISMATCH: 'Lightning provider response was rejected',
+  PROVIDER_UNAVAILABLE: 'Lightning provider unavailable',
+  RULE_NOT_FOUND: 'Pricing rule is unavailable',
+  TENANT_DISABLED: 'Tenant is disabled',
+  TENANT_NOT_FOUND: 'Tenant not found',
+}
+
+function normalizedPublicError(error: unknown): {
+  status: number
+  code: string
+  message: string
+} {
+  if (error instanceof z.ZodError) {
+    return { status: 400, code: 'INVALID_REQUEST', message: 'Request validation failed' }
+  }
+  if (error instanceof LightningError) {
+    return { status: 502, code: 'PROVIDER_UNAVAILABLE', message: 'Lightning provider unavailable' }
+  }
+  const candidate = error as { statusCode?: unknown; code?: unknown } | null
+  const code = typeof candidate?.code === 'string' ? candidate.code : ''
+  const message = PUBLIC_ERROR_MESSAGES[code]
+  const status = typeof candidate?.statusCode === 'number' ? candidate.statusCode : 500
+  if (message && status >= 400 && status <= 599) return { status, code, message }
+  if (status >= 400 && status < 500) {
+    return { status, code: 'INVALID_REQUEST', message: 'Request rejected' }
+  }
+  return { status: 500, code: 'INTERNAL_ERROR', message: 'Internal server error' }
+}
+
 export interface BuildServerDependencies {
   lnd?: LightningReceiveProvider
   bolt12?: Bolt12ReceiveProvider
   startBackgroundJobs?: boolean
+  logStream?: LogDestination
 }
 
 export async function buildServer(
   config: Config = loadConfig(),
   dependencies: BuildServerDependencies = {},
 ): Promise<FastifyInstance> {
+  const app = Fastify({
+    logger: createSafeLoggerOptions(config.LOG_LEVEL, dependencies.logStream),
+    logController: new LogController({ disableRequestLogging: true }),
+    bodyLimit: 16_384,
+    requestTimeout: 15_000,
+  })
+  const logger = app.log as SafeLogger
+
   let lnd = dependencies.lnd
   if (!lnd) {
     const [certificate, macaroon] = await Promise.all([
@@ -94,12 +158,13 @@ export async function buildServer(
         certificatePath: config.LNDK_TLS_CERT_PATH!,
         macaroonPath: config.LNDK_MACAROON_PATH!,
       })
-    } catch (error) {
-      console.warn(JSON.stringify({
-        level: 'warn',
-        code: 'LNDK_UNAVAILABLE',
-        message: error instanceof Error ? error.message : 'LNDK unavailable',
-      }))
+    } catch {
+      safeLog(logger, 'warn', {
+        event: 'provider.connection_failed',
+        providerType: 'lndk',
+        outcome: 'failure',
+        errorCode: 'PROVIDER_UNAVAILABLE',
+      }, 'optional Lightning provider unavailable')
     }
   }
 
@@ -128,7 +193,7 @@ export async function buildServer(
   const webhookRepo = new WebhookRepository(config.DATABASE_URL, databaseOptions)
   const apiKeyService = new ApiKeyService(paymentIntentRepo)
   const tenantService = new TenantService(paymentIntentRepo, apiKeyService)
-  const webhookService = new WebhookService(webhookRepo, paymentIntentRepo)
+  const webhookService = new WebhookService(webhookRepo, paymentIntentRepo, logger)
   const paymentIntentService = new PaymentIntentService(
     lnd,
     paymentIntentRepo,
@@ -140,9 +205,10 @@ export async function buildServer(
       reconciliationIntervalMs: config.PAYMENT_INTENT_RECONCILIATION_INTERVAL_MS,
       watcherRetryBaseMs: config.PAYMENT_INTENT_WATCH_RETRY_BASE_MS,
       watcherRetryMaxMs: config.PAYMENT_INTENT_WATCH_RETRY_MAX_MS,
+      logger,
     },
   )
-  const legacyPaymentService = new PaymentService(lnd, bolt12, legacyRepo, config)
+  const legacyPaymentService = new PaymentService(lnd, bolt12, legacyRepo, config, logger)
 
   if (paymentIntentRepo.tenantCount() === 0) {
     const { tenant, apiKey } = await tenantService.createTenant({
@@ -153,12 +219,10 @@ export async function buildServer(
       mode: 0o600,
       flag: 'wx',
     })
-    console.info(JSON.stringify({
-      level: 'info',
-      code: 'BOOTSTRAP_KEY_WRITTEN',
-      path: config.BOOTSTRAP_KEY_PATH,
-      tenantId: tenant.id,
-    }))
+    safeLog(logger, 'info', {
+      event: 'bootstrap.key_written',
+      outcome: 'success',
+    }, 'bootstrap credential written to configured destination')
     tenantService.upsertPricingRule(tenant.id, {
       productId: 'cherito-coffee-001',
       mode: 'fixed',
@@ -178,27 +242,6 @@ export async function buildServer(
     stopReconciliation = paymentIntentService.startReconciliationLoop()
     stopWebhookRetry = webhookService.startRetryLoop()
   }
-
-  const app = Fastify({
-    logger: {
-      level: config.LOG_LEVEL,
-      redact: [
-        'req.headers.authorization',
-        'req.headers.grpc-metadata-macaroon',
-        '*.macaroon',
-        '*.certificate',
-        '*.clientSecret',
-        '*.clientSecretHash',
-        '*.intentSecret',
-        '*.CHERITO_INTENT_SECRET_KEY',
-        '*.CHERITO_INTENT_SECRET_PREVIOUS_KEYS',
-        '*.webhookSecret',
-        '*.keyHash',
-      ],
-    },
-    bodyLimit: 16_384,
-    requestTimeout: 15_000,
-  })
 
   app.addHook('onClose', async () => {
     stopWebhookRetry()
@@ -232,6 +275,20 @@ export async function buildServer(
       'content-security-policy': "default-src 'none'; frame-ancestors 'none'",
     })
     return payload
+  })
+
+  const requestTenants = new WeakMap<object, string>()
+  app.addHook('onResponse', async (request, reply) => {
+    const status = reply.statusCode
+    safeLog(logger, status >= 500 ? 'error' : status >= 400 ? 'warn' : 'info', {
+      event: 'http.request_completed',
+      requestId: request.id,
+      method: request.method,
+      route: request.routeOptions.url ?? 'unmatched',
+      outcome: status >= 400 ? 'failure' : 'success',
+      tenantId: requestTenants.get(request),
+      httpStatus: status,
+    }, 'request completed')
   })
 
   type RateBucket = { start: number; count: number }
@@ -268,21 +325,31 @@ export async function buildServer(
   app.get('/health', async (_request, reply) => {
     try {
       await lnd.getNodeInfo()
-      return { status: 'ok', lightning: 'connected', provider: lnd.providerType }
+      return { status: 'ok', lightning: 'connected' }
     } catch {
       return reply.code(503).send({
         status: 'degraded',
         lightning: 'disconnected',
-        provider: lnd.providerType,
       })
     }
   })
 
-  app.get('/v1/node', () => lnd.getNodeInfo())
+  app.get('/v1/node', async (request, reply) => {
+    const auth = requireMerchantAuth(request.headers.authorization)
+    if (!auth) {
+      return reply.code(401).send({ code: 'UNAUTHORIZED', message: 'Authentication required' })
+    }
+    requestTenants.set(request, auth.tenantId)
+    return lnd.getNodeInfo()
+  })
   app.get('/v1/capabilities', async () => {
     const base = await lnd.getCapabilities()
     const extra = bolt12 ? await bolt12.getCapabilities().catch(() => undefined) : undefined
-    return { ...base, bolt12Receive: extra?.bolt12Receive === true }
+    return {
+      bolt11Receive: base.bolt11Receive,
+      bolt12Receive: extra?.bolt12Receive === true,
+      invoiceStreaming: base.invoiceStreaming,
+    }
   })
 
   app.post('/v1/payment-intents', async (request, reply) => {
@@ -290,6 +357,7 @@ export async function buildServer(
     if (!auth) {
       return reply.code(401).send({ code: 'UNAUTHORIZED', message: 'Valid merchant API key required' })
     }
+    requestTenants.set(request, auth.tenantId)
     if (!checkRateLimit(request.ip)) {
       return reply.code(429).send({ code: 'RATE_LIMITED', message: 'Too many requests' })
     }
@@ -321,6 +389,7 @@ export async function buildServer(
     if (!auth) {
       return reply.code(401).send({ code: 'UNAUTHORIZED', message: 'Valid merchant API key required' })
     }
+    requestTenants.set(request, auth.tenantId)
     const intent = paymentIntentService.getMerchantIntent(auth.tenantId, request.params.id)
     return intent ?? reply.code(404).send({ code: 'NOT_FOUND', message: 'Payment intent not found' })
   })
@@ -332,6 +401,7 @@ export async function buildServer(
       if (!intent) {
         return reply.code(404).send({ code: 'NOT_FOUND', message: 'Payment intent not found' })
       }
+      requestTenants.set(request, intent.tenantId)
       return paymentIntentService.toClient(intent)
     },
   )
@@ -343,6 +413,7 @@ export async function buildServer(
       if (!intent) {
         return reply.code(404).send({ code: 'NOT_FOUND', message: 'Payment intent not found' })
       }
+      requestTenants.set(request, intent.tenantId)
       reply.hijack()
       reply.raw.writeHead(200, {
         'content-type': 'text/event-stream',
@@ -431,16 +502,20 @@ export async function buildServer(
   })
 
   app.setErrorHandler((error, request, reply) => {
-    const typed = error as Error & { statusCode?: number; code?: string }
-    const status = typed.statusCode
-      ?? (error instanceof z.ZodError ? 400 : error instanceof LightningError ? 502 : 500)
-    request.log.error(
-      { code: typed.code ?? 'INTERNAL_ERROR', message: typed.message },
-      'request failed',
-    )
-    reply.code(status).send({
-      code: typed.code ?? 'INTERNAL_ERROR',
-      message: status === 500 ? 'Internal server error' : typed.message,
+    const normalized = normalizedPublicError(error)
+    safeLog(logger, normalized.status >= 500 ? 'error' : 'warn', {
+      event: 'http.request_failed',
+      requestId: request.id,
+      method: request.method,
+      route: request.routeOptions.url ?? 'unmatched',
+      outcome: 'failure',
+      tenantId: requestTenants.get(request),
+      errorCode: normalized.code,
+      httpStatus: normalized.status,
+    }, 'request failed')
+    reply.code(normalized.status).send({
+      code: normalized.code,
+      message: normalized.message,
       requestId: request.id,
     })
   })
@@ -448,15 +523,15 @@ export async function buildServer(
   return app
 }
 
-if (process.env.NODE_ENV !== 'test') {
+async function startGateway(): Promise<void> {
   const config = loadConfig()
-  buildServer(config)
-    .then((app) => app.listen({ port: config.PORT, host: config.HOST }))
-    .catch((error: unknown) => {
-      console.error(JSON.stringify({
-        level: 'fatal',
-        message: error instanceof Error ? error.message : 'Startup failed',
-      }))
-      process.exitCode = 1
-    })
+  const app = await buildServer(config)
+  await app.listen({ port: config.PORT, host: config.HOST })
+}
+
+if (process.env.NODE_ENV !== 'test') {
+  void startGateway().catch(() => {
+    writeSafeProcessEvent(process.stderr, 'fatal', 'STARTUP_FAILED')
+    process.exitCode = 1
+  })
 }

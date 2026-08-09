@@ -1,7 +1,8 @@
 import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
 import dns from 'node:dns/promises'
 import type { TenantRepository } from '../persistence/tenant-repository.js'
-import type { WebhookRepository,WebhookDelivery } from '../persistence/webhook-repository.js'
+import type { WebhookRepository, WebhookDelivery } from '../persistence/webhook-repository.js'
+import { NOOP_SAFE_LOGGER, safeLog, type SafeLogger } from '../logging/safe-logger.js'
 
 /** Maximum delivery attempts before a webhook is marked permanently failed */
 const MAX_ATTEMPTS = 7
@@ -49,6 +50,7 @@ export class WebhookService {
   constructor(
     private readonly webhookRepo: WebhookRepository,
     private readonly tenantRepo: TenantRepository,
+    private readonly logger: SafeLogger = NOOP_SAFE_LOGGER,
   ) {}
 
   /**
@@ -151,8 +153,13 @@ export class WebhookService {
       } else {
         this.scheduleRetry(delivery)
       }
-    } catch (err) {
-      console.error('Delivery failed:', err)
+    } catch {
+      safeLog(this.logger, 'error', {
+        event: 'webhook.delivery_failed',
+        outcome: 'failure',
+        errorCode: 'WEBHOOK_DELIVERY_FAILED',
+        attemptCount: delivery.attemptCount + 1,
+      }, 'webhook delivery failed')
       this.scheduleRetry(delivery)
     }
   }

@@ -11,6 +11,12 @@ import type {
 import type { Config } from "../config.js";
 import type { Repository, Session } from "../persistence/repository.js";
 import { findProduct } from "./catalog.js";
+import {
+  NOOP_SAFE_LOGGER,
+  safeLog,
+  safeProviderErrorCode,
+  type SafeLogger,
+} from '../logging/safe-logger.js'
 const hash = (v: string) => createHash("sha256").update(v).digest("hex");
 export class PaymentService {
   private listeners = new Map<string, Set<(s: Session) => void>>();
@@ -19,6 +25,7 @@ export class PaymentService {
     private bolt12: Bolt12ReceiveProvider | undefined,
     private repo: Repository,
     private config: Config,
+    private logger: SafeLogger = NOOP_SAFE_LOGGER,
   ) {}
   async create(productId: string, quantity: number, key: string) {
     const payloadHash = hash(JSON.stringify({ productId, quantity })),
@@ -58,14 +65,23 @@ export class PaymentService {
       });
     const orderId = `ord_${randomUUID()}`,
       id = `chk_${randomUUID()}`,
-      token = randomBytes(32).toString("base64url"),
+      token = randomBytes(32).toString("base64url");
+    let invoice: Awaited<ReturnType<LightningReceiveProvider['createInvoice']>>
+    try {
       invoice = await this.lnd.createInvoice({
         orderId,
         amountSats: amount,
         memo: `Cherito order ${orderId}`,
         expirySeconds: this.config.DEFAULT_INVOICE_EXPIRY_SECONDS,
-      }),
-      s: Session = {
+      })
+    } catch (error) {
+      this.logProviderFailure('legacy_checkout.invoice_creation_failed', error)
+      throw Object.assign(new Error('Lightning provider unavailable'), {
+        statusCode: 502,
+        code: 'PROVIDER_UNAVAILABLE',
+      })
+    }
+    const s: Session = {
         id,
         orderId,
         productId,
@@ -85,7 +101,9 @@ export class PaymentService {
         Date.now() + this.config.IDEMPOTENCY_TTL_SECONDS * 1000,
       ).toISOString(),
     });
-    void this.watch(s);
+    void this.watch(s).catch((error: unknown) => {
+      this.logProviderFailure('legacy_checkout.watcher_failed', error)
+    });
     return { ...this.public(s), statusToken: token };
   }
   public(s: Session) {
@@ -114,11 +132,15 @@ export class PaymentService {
   }
   private async watch(s: Session) {
     await this.lnd.subscribeToInvoice(s.paymentHash, (i) => {
-      this.repo.settle(s.paymentHash, i);
-      const current = this.repo.session(s.id);
-      if (current)
-        for (const listener of this.listeners.get(s.id) ?? [])
-          listener(current);
+      try {
+        this.repo.settle(s.paymentHash, i);
+        const current = this.repo.session(s.id);
+        if (current)
+          for (const listener of this.listeners.get(s.id) ?? [])
+            listener(current);
+      } catch (error) {
+        this.logProviderFailure('legacy_checkout.watcher_callback_failed', error)
+      }
     });
   }
   async createOffer(productId: string) {
@@ -133,22 +155,49 @@ export class PaymentService {
         statusCode: 501,
         code: "BOLT12_NOT_CONFIGURED",
       });
-    const caps = await this.bolt12.getCapabilities();
+    let caps
+    try {
+      caps = await this.bolt12.getCapabilities();
+    } catch (error) {
+      this.logProviderFailure('legacy_offer.capabilities_failed', error)
+      throw Object.assign(new Error('Lightning provider unavailable'), {
+        statusCode: 502,
+        code: 'PROVIDER_UNAVAILABLE',
+      })
+    }
     if (!caps.bolt12Receive)
       throw Object.assign(new Error("LNDK is unavailable"), {
         statusCode: 503,
         code: "LNDK_UNAVAILABLE",
       });
-    const offer = await this.bolt12.createOffer({
-      productId,
-      amountSats: product.priceSats,
-      description: product.name,
-    });
+    let offer: Awaited<ReturnType<Bolt12ReceiveProvider['createOffer']>>
+    try {
+      offer = await this.bolt12.createOffer({
+        productId,
+        amountSats: product.priceSats,
+        description: product.name,
+      });
+    } catch (error) {
+      this.logProviderFailure('legacy_offer.creation_failed', error)
+      throw Object.assign(new Error('Lightning provider unavailable'), {
+        statusCode: 502,
+        code: 'PROVIDER_UNAVAILABLE',
+      })
+    }
     this.repo.saveOffer(productId, offer);
     return {
       offerId: offer.offerId,
       offer: offer.offer,
       amountSats: offer.amountSats.toString(),
     };
+  }
+
+  private logProviderFailure(event: string, error: unknown): void {
+    safeLog(this.logger, 'error', {
+      event,
+      providerType: this.lnd.providerType,
+      outcome: 'failure',
+      errorCode: safeProviderErrorCode(error),
+    }, 'Lightning operation failed')
   }
 }

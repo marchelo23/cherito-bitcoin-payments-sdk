@@ -8,6 +8,7 @@ import {
   openDatabase,
   validateDatabaseIntegrity,
 } from './persistence/database-lifecycle.js'
+import { writeSafeProcessEvent } from './logging/safe-logger.js'
 
 function argument(name: string): string | undefined {
   const index = process.argv.indexOf(`--${name}`)
@@ -32,36 +33,25 @@ function intentSecretCipher(): PaymentIntentSecretCipher {
 async function main(): Promise<void> {
   const command = process.argv[2]
   if (command === 'backup') {
-    const result = await createDatabaseBackup({
+    await createDatabaseBackup({
       databaseUrl: argument('database') ?? process.env.DATABASE_URL ?? '',
       destination: requiredArgument('output'),
       applicationVersion: process.env.npm_package_version ?? '1.0.0',
       reason: argument('reason') ?? 'operator backup',
     })
-    console.info(JSON.stringify({
-      code: 'DATABASE_BACKUP_CREATED',
-      path: result.path,
-      metadataPath: result.metadataPath,
-      schemaVersion: result.metadata.schemaVersion,
-      createdAt: result.metadata.createdAt,
-    }))
+    writeSafeProcessEvent(process.stdout, 'info', 'DATABASE_BACKUP_CREATED')
     return
   }
 
   if (command === 'restore') {
-    const result = await restoreDatabaseBackup({
+    await restoreDatabaseBackup({
       backupPath: requiredArgument('input'),
       destinationDatabaseUrl: argument('database') ?? process.env.DATABASE_URL ?? '',
       intentSecretCipher: intentSecretCipher(),
       backupDirectory: process.env.DATABASE_BACKUP_DIR,
       busyTimeoutMs: Number(process.env.SQLITE_BUSY_TIMEOUT_MS ?? 5_000),
     })
-    console.info(JSON.stringify({
-      code: 'DATABASE_RESTORE_COMPLETED',
-      schemaVersion: result.schemaVersion,
-      requiresProviderReconciliation: result.requiresProviderReconciliation,
-      nextStep: 'Start the gateway; it reconciles non-terminal payments before accepting traffic.',
-    }))
+    writeSafeProcessEvent(process.stdout, 'info', 'DATABASE_RESTORE_COMPLETED')
     return
   }
 
@@ -70,10 +60,8 @@ async function main(): Promise<void> {
     const db = openDatabase(databaseUrl, { readOnly: true, migrate: false })
     try {
       validateDatabaseIntegrity(db)
-      console.info(JSON.stringify({
-        code: 'DATABASE_VALID',
-        schemaVersion: currentSchemaVersion(db),
-      }))
+      currentSchemaVersion(db)
+      writeSafeProcessEvent(process.stdout, 'info', 'DATABASE_VALID')
     } finally {
       db.close()
     }
@@ -85,10 +73,7 @@ async function main(): Promise<void> {
   )
 }
 
-void main().catch((error: unknown) => {
-  console.error(JSON.stringify({
-    code: (error as { code?: string }).code ?? 'DATABASE_COMMAND_FAILED',
-    message: error instanceof Error ? error.message : String(error),
-  }))
+void main().catch(() => {
+  writeSafeProcessEvent(process.stderr, 'error', 'DATABASE_COMMAND_FAILED')
   process.exitCode = 1
 })

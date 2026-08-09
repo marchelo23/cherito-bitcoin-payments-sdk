@@ -12,10 +12,11 @@ import { TenantRepository } from '../src/persistence/tenant-repository.js'
 import { WebhookService } from '../src/services/webhook-service.js'
 import { TenantService } from '../src/services/tenant-service.js'
 import { ApiKeyService } from '../src/services/api-key-service.js'
+import type { SafeLogger } from '../src/logging/safe-logger.js'
 
 const setupCleanups: Array<() => void> = []
 
-function setup() {
+function setup(logger?: SafeLogger) {
   const directory = mkdtempSync(join(tmpdir(), 'cherito-webhook-test-'))
   const dbFile = `file:${join(directory, 'webhooks.sqlite')}`
   const webhookRepo = new WebhookRepository(dbFile)
@@ -24,7 +25,7 @@ function setup() {
     dbFile,
     new PaymentIntentSecretCipher(Buffer.alloc(32, 0x77).toString('base64')),
   )
-  const webhookService = new WebhookService(webhookRepo, tenantRepo)
+  const webhookService = new WebhookService(webhookRepo, tenantRepo, logger)
   const apiKeyService = new ApiKeyService(tenantRepo as never)
   const tenantService = new TenantService(tenantRepo, apiKeyService)
   setupCleanups.push(() => {
@@ -104,6 +105,57 @@ describe('WebhookService', () => {
     
     const delivery = webhookRepo.delivery(tenant.id, deliveryId)
     assert.equal(delivery?.status, 'failed', 'Should fail due to SSRF protection')
+  })
+
+  test('provider failures are logged without webhook secrets, URLs, or exception text', async () => {
+    const forbidden = 'SHOULD_NEVER_APPEAR_IN_LOGS_123'
+    const records: string[] = []
+    const write = (fields: Record<string, unknown>, message?: string) => {
+      records.push(JSON.stringify({ fields, message }))
+    }
+    const logger: SafeLogger = {
+      debug: write,
+      info: write,
+      warn: write,
+      error: write,
+      fatal: write,
+    }
+    const { webhookRepo, webhookService, tenantService, createTestIntent } = setup(logger)
+    const { tenant } = await tenantService.createTenant({ name: 'Safe Log Test' })
+    tenantService.configureWebhookUrl(tenant.id, 'http://127.0.0.1:65534/webhook')
+    const withSecret = tenantService.rotateWebhookSecret(tenant.id)
+    assert.ok(withSecret.webhookSecret)
+    createTestIntent(tenant.id, 'pi_safe_log')
+    const eventId = `evt_${randomUUID()}`
+    webhookRepo.createEvent({
+      id: eventId,
+      tenantId: tenant.id,
+      paymentIntentId: 'pi_safe_log',
+      type: 'payment_intent.succeeded',
+      payload: JSON.stringify({ note: forbidden }),
+      createdAt: new Date().toISOString(),
+    })
+    webhookRepo.createDelivery({
+      id: `wd_${randomUUID()}`,
+      eventId,
+      tenantId: tenant.id,
+      status: 'pending',
+      attemptCount: 0,
+      lastAttemptAt: null,
+      nextAttemptAt: new Date().toISOString(),
+      deliveredAt: null,
+      createdAt: new Date().toISOString(),
+    })
+    mock.method(globalThis, 'fetch', async () => {
+      throw new Error(`${forbidden} http://127.0.0.1:65534/webhook`)
+    })
+
+    await webhookService.flush()
+
+    const output = records.join('\n')
+    assert.match(output, /WEBHOOK_DELIVERY_FAILED/)
+    assert.doesNotMatch(output, new RegExp(forbidden))
+    assert.doesNotMatch(output, /127\.0\.0\.1|webhookSecret|whsec_/)
   })
 
   test('tenant-configurable: config changes take effect on next flush', async () => {
@@ -196,11 +248,6 @@ describe('WebhookService', () => {
       assert.ok(capturedHeader.includes('v1='))
       
       const isValid = WebhookService.verify(tWithSecret.webhookSecret!, capturedHeader, '{"some":"data"}')
-      if (!isValid) {
-        console.log('secret', tWithSecret.webhookSecret)
-        console.log('header', capturedHeader)
-        console.log('expected sig', createHmac('sha256', tWithSecret.webhookSecret!).update(`${capturedHeader.split(',')[0]!.slice(2)}.{"some":"data"}`).digest('hex'))
-      }
       assert.equal(isValid, true, 'Signature should be valid')
       
       const isInvalid = WebhookService.verify(tWithSecret.webhookSecret!, capturedHeader, '{"some":"tampered"}')

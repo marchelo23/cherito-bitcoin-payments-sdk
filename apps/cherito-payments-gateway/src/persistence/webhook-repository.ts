@@ -134,6 +134,28 @@ export class WebhookRepository {
     return rows.map(r => r as unknown as WebhookDelivery)
   }
 
+  failedDeliveries(tenantId: string, limit: number, afterId?: string): WebhookDelivery[] {
+    const bounded = Math.max(1, Math.min(100, Math.trunc(limit)))
+    const rows = afterId
+      ? this.db.prepare(`
+          SELECT id, event_id eventId, tenant_id tenantId, status,
+            attempt_count attemptCount, last_attempt_at lastAttemptAt,
+            next_attempt_at nextAttemptAt, delivered_at deliveredAt, created_at createdAt
+          FROM webhook_deliveries
+          WHERE tenant_id=? AND status IN ('failed','permanently_failed') AND id<?
+          ORDER BY id DESC LIMIT ?
+        `).all(tenantId, afterId, bounded)
+      : this.db.prepare(`
+          SELECT id, event_id eventId, tenant_id tenantId, status,
+            attempt_count attemptCount, last_attempt_at lastAttemptAt,
+            next_attempt_at nextAttemptAt, delivered_at deliveredAt, created_at createdAt
+          FROM webhook_deliveries
+          WHERE tenant_id=? AND status IN ('failed','permanently_failed')
+          ORDER BY id DESC LIMIT ?
+        `).all(tenantId, bounded)
+    return (rows as Record<string, unknown>[]).map((row) => row as unknown as WebhookDelivery)
+  }
+
   markDelivered(tenantId: string, id: string): void {
     const now = new Date().toISOString()
     this.db

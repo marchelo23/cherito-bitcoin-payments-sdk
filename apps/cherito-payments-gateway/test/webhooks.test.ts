@@ -270,6 +270,52 @@ describe('WebhookService', () => {
       server.close()
     }
   })
+
+  test('automatic retry preserves logical event identity and signs every attempt freshly', async () => {
+    const { webhookRepo, webhookService, tenantService, createTestIntent } = setup()
+    const { tenant } = await tenantService.createTenant({ name: 'Retry Test' })
+    const server = await startSequenceServer([500, 200])
+    try {
+      tenantService.configureWebhookUrl(tenant.id, `http://127.0.0.1:${server.port}/webhook`)
+      tenantService.rotateWebhookSecret(tenant.id)
+      const eventId = `evt_${randomUUID()}`
+      const deliveryId = `wd_${randomUUID()}`
+      createTestIntent(tenant.id, 'pi_retry')
+      webhookRepo.createEvent({
+        id: eventId,
+        tenantId: tenant.id,
+        paymentIntentId: 'pi_retry',
+        type: 'payment_intent.succeeded',
+        payload: '{"retry":true}',
+        createdAt: new Date().toISOString(),
+      })
+      webhookRepo.createDelivery({
+        id: deliveryId,
+        eventId,
+        tenantId: tenant.id,
+        status: 'pending',
+        attemptCount: 0,
+        lastAttemptAt: null,
+        nextAttemptAt: new Date().toISOString(),
+        deliveredAt: null,
+        createdAt: new Date().toISOString(),
+      })
+      await webhookService.flush()
+      assert.equal(webhookRepo.delivery(tenant.id, deliveryId)?.status, 'failed')
+      webhookRepo.markFailed(tenant.id, deliveryId, new Date(0).toISOString())
+      await webhookService.flush()
+      assert.equal(webhookRepo.delivery(tenant.id, deliveryId)?.status, 'delivered')
+      assert.equal(server.requests.length, 2)
+      assert.deepEqual(
+        server.requests.map((request) => request.headers['x-cherito-event-id']),
+        [eventId, eventId],
+      )
+      const signatures = server.requests.map((request) => request.headers['cherito-signature'])
+      assert.notEqual(signatures[0], signatures[1])
+    } finally {
+      server.close()
+    }
+  })
 })
 
 import * as http from 'node:http'
@@ -289,6 +335,25 @@ function startTestServer(): Promise<{ port: number, requests: http.IncomingMessa
         requests,
         close: () => server.close()
       })
+    })
+  })
+}
+
+function startSequenceServer(statuses: number[]): Promise<{
+  port: number
+  requests: http.IncomingMessage[]
+  close: () => void
+}> {
+  return new Promise((resolve) => {
+    const requests: http.IncomingMessage[] = []
+    const server = http.createServer((request, response) => {
+      requests.push(request)
+      response.writeHead(statuses.shift() ?? 200)
+      response.end()
+    })
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address() as import('net').AddressInfo
+      resolve({ port: address.port, requests, close: () => server.close() })
     })
   })
 }

@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Cherito Payment Link</title>
+</head>
+<body>
+  <h1>Pay with Lightning</h1>
+  <cherito-bitcoin-checkout
+    mode="payment-link"
+    api-url="https://gateway.example"
+    payment-link-slug="pl_REPLACE_WITH_THE_PUBLIC_SLUG">
+  </cherito-bitcoin-checkout>
+
+  <!-- Pin an exact published package version in production. -->
+  <script type="module" src="../packages/cherito-checkout-widget/dist/index.js"></script>
+  <script type="module">
+    const checkout = document.querySelector('cherito-bitcoin-checkout')
+    checkout.addEventListener('cherito:payment-settled', (event) => {
+      // Informational UI only. Do not fulfill from this browser event.
+      console.info('Payment settled; backend verification is still required', event.detail.paymentIntentId)
+    })
+  </script>
+</body>
+</html>

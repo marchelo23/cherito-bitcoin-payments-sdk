@@ -48,7 +48,8 @@ export class LndRestProvider implements LightningReceiveProvider {
   }
 
   async getCapabilities(): Promise<LightningCapabilities> {
-    return { bolt11Receive: true, bolt12Receive: false, invoiceStreaming: true, provider: 'lnd' }
+    // subscribeToInvoice currently polls getInvoice; do not advertise native streaming.
+    return { bolt11Receive: true, bolt12Receive: false, invoiceStreaming: false, provider: 'lnd' }
   }
 
   private async request(path: string, method = 'GET', body?: Json, signal?: AbortSignal): Promise<Json> {

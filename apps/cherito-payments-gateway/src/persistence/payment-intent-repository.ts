@@ -36,6 +36,45 @@ export interface PaymentIntent {
   updatedAt: string
 }
 
+export type PaymentLinkMode = 'fixed' | 'open_amount' | 'donation'
+
+export interface PaymentLink {
+  id: string
+  tenantId: string
+  slug: string
+  mode: PaymentLinkMode
+  pricingRuleId: string | null
+  minAmountSats: string | null
+  maxAmountSats: string | null
+  title: string
+  description: string | null
+  expiresAt: string | null
+  maxUses: number | null
+  useCount: number
+  reservedUses: number
+  active: boolean
+  indexable: boolean
+  createdAt: string
+  updatedAt: string
+}
+
+export interface PaymentLinkReservation {
+  id: string
+  tenantId: string
+  paymentLinkId: string
+  paymentIntentId: string
+  createdAt: string
+}
+
+export interface MerchantActionIdempotency {
+  tenantId: string
+  route: string
+  idempotencyKey: string
+  payloadHash: string
+  resourceId: string
+  createdAt: string
+}
+
 export interface PaymentIntentTransition {
   tenantId: string
   paymentHash: string
@@ -91,6 +130,26 @@ const PAYMENT_INTENT_COLUMNS = `
   updated_at updatedAt
 `
 
+const PAYMENT_LINK_COLUMNS = `
+  id,
+  tenant_id tenantId,
+  slug,
+  mode,
+  pricing_rule_id pricingRuleId,
+  min_amount_sats minAmountSats,
+  max_amount_sats maxAmountSats,
+  title,
+  description,
+  expires_at expiresAt,
+  max_uses maxUses,
+  use_count useCount,
+  reserved_uses reservedUses,
+  active,
+  indexable,
+  created_at createdAt,
+  updated_at updatedAt
+`
+
 /**
  * Payment Intent persistence extends the existing tenant repository so tenant,
  * pricing-rule and intent writes share one SQLite connection and transaction
@@ -125,6 +184,284 @@ export class PaymentIntentRepository extends TenantRepository {
       intent.tenantId,
       intent.id,
     )
+    this.insertPaymentIntent(intent, encrypted)
+  }
+
+  createPaymentIntentForReservedLink(
+    intent: PaymentIntent,
+    reservationId: string,
+  ): void {
+    if (!intent.paymentLinkId) throw new Error('Reserved Payment Intent requires a Payment Link')
+    const encrypted = this.intentSecretCipher.encrypt(
+      intent.intentSecret,
+      intent.tenantId,
+      intent.id,
+    )
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const reservation = this.db.prepare(`
+        SELECT id FROM payment_link_use_reservations
+        WHERE id=? AND tenant_id=? AND payment_link_id=? AND payment_intent_id=?
+      `).get(reservationId, intent.tenantId, intent.paymentLinkId, intent.id)
+      if (!reservation) {
+        throw Object.assign(new Error('Payment Link reservation is unavailable'), {
+          statusCode: 409,
+          code: 'PAYMENT_LINK_RESERVATION_INVALID',
+        })
+      }
+      this.insertPaymentIntent(intent, encrypted)
+      const committed = this.db.prepare(`
+        UPDATE payment_links
+        SET reserved_uses=reserved_uses-1, use_count=use_count+1, updated_at=?
+        WHERE tenant_id=? AND id=? AND reserved_uses>0
+      `).run(intent.createdAt, intent.tenantId, intent.paymentLinkId) as { changes: number }
+      if (committed.changes !== 1) throw new Error('Payment Link reservation counter is invalid')
+      this.db.prepare('DELETE FROM payment_link_use_reservations WHERE id=?')
+        .run(reservationId)
+      this.db.exec('COMMIT')
+    } catch (error) {
+      if (this.db.isTransaction) this.db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  createPaymentLink(
+    link: PaymentLink,
+    idempotency?: MerchantActionIdempotency,
+  ): { created: boolean; resourceId: string; payloadHash: string | null } {
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      if (idempotency) {
+        const existing = this.merchantActionIdempotency(
+          idempotency.tenantId,
+          idempotency.route,
+          idempotency.idempotencyKey,
+        )
+        if (existing) {
+          this.db.exec('COMMIT')
+          return {
+            created: false,
+            resourceId: existing.resourceId,
+            payloadHash: existing.payloadHash,
+          }
+        }
+      }
+      this.db.prepare(`
+        INSERT INTO payment_links (
+          id, tenant_id, slug, mode, pricing_rule_id, min_amount_sats,
+          max_amount_sats, title, description, expires_at, max_uses,
+          use_count, reserved_uses, active, indexable, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        link.id,
+        link.tenantId,
+        link.slug,
+        link.mode,
+        link.pricingRuleId,
+        link.minAmountSats,
+        link.maxAmountSats,
+        link.title,
+        link.description,
+        link.expiresAt,
+        link.maxUses,
+        link.useCount,
+        link.reservedUses,
+        link.active ? 1 : 0,
+        link.indexable ? 1 : 0,
+        link.createdAt,
+        link.updatedAt,
+      )
+      if (idempotency) {
+        this.db.prepare(`
+          INSERT INTO merchant_action_idempotency
+            (tenant_id, route, idempotency_key, payload_hash, resource_id, created_at)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `).run(
+          idempotency.tenantId,
+          idempotency.route,
+          idempotency.idempotencyKey,
+          idempotency.payloadHash,
+          idempotency.resourceId,
+          idempotency.createdAt,
+        )
+      }
+      this.db.exec('COMMIT')
+      return {
+        created: true,
+        resourceId: link.id,
+        payloadHash: idempotency?.payloadHash ?? null,
+      }
+    } catch (error) {
+      if (this.db.isTransaction) this.db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  paymentLink(tenantId: string, id: string): PaymentLink | undefined {
+    const row = this.db.prepare(`
+      SELECT ${PAYMENT_LINK_COLUMNS} FROM payment_links WHERE tenant_id=? AND id=?
+    `).get(tenantId, id) as Record<string, unknown> | undefined
+    return row ? this.materializePaymentLink(row) : undefined
+  }
+
+  paymentLinkBySlug(slug: string): PaymentLink | undefined {
+    const row = this.db.prepare(`
+      SELECT ${PAYMENT_LINK_COLUMNS} FROM payment_links WHERE slug=?
+    `).get(slug) as Record<string, unknown> | undefined
+    return row ? this.materializePaymentLink(row) : undefined
+  }
+
+  listPaymentLinks(tenantId: string, limit: number, afterId?: string): PaymentLink[] {
+    const bounded = Math.max(1, Math.min(100, Math.trunc(limit)))
+    if (!afterId) {
+      return (this.db.prepare(`
+        SELECT ${PAYMENT_LINK_COLUMNS} FROM payment_links
+        WHERE tenant_id=? ORDER BY created_at DESC, id DESC LIMIT ?
+      `).all(tenantId, bounded) as Record<string, unknown>[])
+        .map((row) => this.materializePaymentLink(row))
+    }
+    const cursor = this.db.prepare(`
+      SELECT created_at createdAt, id FROM payment_links WHERE tenant_id=? AND id=?
+    `).get(tenantId, afterId) as { createdAt: string; id: string } | undefined
+    if (!cursor) return []
+    const rows = this.db.prepare(`
+      SELECT ${PAYMENT_LINK_COLUMNS} FROM payment_links
+      WHERE tenant_id=? AND (created_at < ? OR (created_at=? AND id < ?))
+      ORDER BY created_at DESC, id DESC LIMIT ?
+    `).all(
+      tenantId,
+      cursor.createdAt,
+      cursor.createdAt,
+      cursor.id,
+      bounded,
+    ) as unknown as Record<string, unknown>[]
+    return rows.map((row) => this.materializePaymentLink(row))
+  }
+
+  updatePaymentLink(link: PaymentLink): boolean {
+    const result = this.db.prepare(`
+      UPDATE payment_links SET slug=?, mode=?, pricing_rule_id=?, min_amount_sats=?,
+        max_amount_sats=?, title=?, description=?, expires_at=?, max_uses=?,
+        active=?, indexable=?, updated_at=?
+      WHERE tenant_id=? AND id=?
+    `).run(
+      link.slug,
+      link.mode,
+      link.pricingRuleId,
+      link.minAmountSats,
+      link.maxAmountSats,
+      link.title,
+      link.description,
+      link.expiresAt,
+      link.maxUses,
+      link.active ? 1 : 0,
+      link.indexable ? 1 : 0,
+      link.updatedAt,
+      link.tenantId,
+      link.id,
+    ) as { changes: number }
+    return result.changes === 1
+  }
+
+  reservePaymentLinkUse(reservation: PaymentLinkReservation, now: string): boolean {
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const reserved = this.db.prepare(`
+        UPDATE payment_links
+        SET reserved_uses=reserved_uses+1, updated_at=?
+        WHERE tenant_id=? AND id=? AND active=1
+          AND (expires_at IS NULL OR expires_at>?)
+          AND (max_uses IS NULL OR use_count+reserved_uses<max_uses)
+      `).run(now, reservation.tenantId, reservation.paymentLinkId, now) as { changes: number }
+      if (reserved.changes !== 1) {
+        this.db.exec('ROLLBACK')
+        return false
+      }
+      this.db.prepare(`
+        INSERT INTO payment_link_use_reservations
+          (id, tenant_id, payment_link_id, payment_intent_id, created_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(
+        reservation.id,
+        reservation.tenantId,
+        reservation.paymentLinkId,
+        reservation.paymentIntentId,
+        reservation.createdAt,
+      )
+      this.db.exec('COMMIT')
+      return true
+    } catch (error) {
+      if (this.db.isTransaction) this.db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  releasePaymentLinkReservation(reservationId: string): boolean {
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const reservation = this.db.prepare(`
+        SELECT tenant_id tenantId, payment_link_id paymentLinkId
+        FROM payment_link_use_reservations WHERE id=?
+      `).get(reservationId) as { tenantId: string; paymentLinkId: string } | undefined
+      if (!reservation) {
+        this.db.exec('ROLLBACK')
+        return false
+      }
+      this.db.prepare(`
+        UPDATE payment_links SET reserved_uses=reserved_uses-1
+        WHERE tenant_id=? AND id=? AND reserved_uses>0
+      `).run(reservation.tenantId, reservation.paymentLinkId)
+      this.db.prepare('DELETE FROM payment_link_use_reservations WHERE id=?')
+        .run(reservationId)
+      this.db.exec('COMMIT')
+      return true
+    } catch (error) {
+      if (this.db.isTransaction) this.db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  releaseAllPaymentLinkReservations(): number {
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const rows = this.db.prepare(`
+        SELECT tenant_id tenantId, payment_link_id paymentLinkId, COUNT(*) count
+        FROM payment_link_use_reservations GROUP BY tenant_id, payment_link_id
+      `).all() as Array<{ tenantId: string; paymentLinkId: string; count: number }>
+      for (const row of rows) {
+        this.db.prepare(`
+          UPDATE payment_links
+          SET reserved_uses=MAX(0, reserved_uses-?), updated_at=?
+          WHERE tenant_id=? AND id=?
+        `).run(row.count, new Date().toISOString(), row.tenantId, row.paymentLinkId)
+      }
+      const removed = this.db.prepare('DELETE FROM payment_link_use_reservations')
+        .run() as { changes: number }
+      this.db.exec('COMMIT')
+      return removed.changes
+    } catch (error) {
+      if (this.db.isTransaction) this.db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  merchantActionIdempotency(
+    tenantId: string,
+    route: string,
+    idempotencyKey: string,
+  ): MerchantActionIdempotency | undefined {
+    return this.db.prepare(`
+      SELECT tenant_id tenantId, route, idempotency_key idempotencyKey,
+        payload_hash payloadHash, resource_id resourceId, created_at createdAt
+      FROM merchant_action_idempotency
+      WHERE tenant_id=? AND route=? AND idempotency_key=?
+    `).get(tenantId, route, idempotencyKey) as MerchantActionIdempotency | undefined
+  }
+
+  private insertPaymentIntent(
+    intent: PaymentIntent,
+    encrypted: EncryptedIntentSecret,
+  ): void {
     this.db
       .prepare(
         `INSERT INTO payment_intents (
@@ -290,6 +627,14 @@ export class PaymentIntentRepository extends TenantRepository {
       createdAt: row.createdAt,
       updatedAt: row.updatedAt,
     }
+  }
+
+  private materializePaymentLink(row: Record<string, unknown>): PaymentLink {
+    return {
+      ...row,
+      active: row.active === 1,
+      indexable: row.indexable === 1,
+    } as unknown as PaymentLink
   }
 
   private persistTransitionEvent(

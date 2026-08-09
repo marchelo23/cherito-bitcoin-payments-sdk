@@ -524,6 +524,28 @@ describe('Payment Intent idempotency and tenant isolation', () => {
     const secondRule = harness.tenantService.upsertPricingRule(harness.tenantId, {
       productId: 'second-product', name: 'Second', mode: 'fixed', priceSats: '1000', maxQuantity: 5,
     })
+    const linkTimestamp = new Date().toISOString()
+    for (const id of ['link-a', 'link-b']) {
+      harness.repo.createPaymentLink({
+        id,
+        tenantId: harness.tenantId,
+        slug: `pl_${id.replace('-', '').padEnd(32, 'x')}`,
+        mode: 'open_amount',
+        pricingRuleId: null,
+        minAmountSats: '10',
+        maxAmountSats: '10000',
+        title: id,
+        description: null,
+        expiresAt: null,
+        maxUses: null,
+        useCount: 0,
+        reservedUses: 0,
+        active: true,
+        indexable: false,
+        createdAt: linkTimestamp,
+        updatedAt: linkTimestamp,
+      })
+    }
     const cases: Array<[CreatePaymentIntentInput, CreatePaymentIntentInput]> = [
       [
         { tenantId: harness.tenantId, productId: 'first-product' },

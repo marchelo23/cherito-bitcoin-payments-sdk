@@ -74,6 +74,10 @@ const schema = z.object({
   PAYMENT_INTENT_RECOVERY_CONCURRENCY: z.coerce.number().int().min(1).max(50).default(5),
   PAYMENT_INTENT_RECONCILIATION_INTERVAL_MS: z.coerce.number().int().min(1_000).default(60_000),
   WEBHOOK_RETRY_INTERVAL_MS: z.coerce.number().int().min(100).default(30_000),
+  WEBHOOK_ALLOW_PRIVATE_DESTINATIONS: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((value) => value === 'true'),
   PAYMENT_INTENT_WATCH_RETRY_BASE_MS: z.coerce.number().int().min(100).default(1_000),
   PAYMENT_INTENT_WATCH_RETRY_MAX_MS: z.coerce.number().int().min(1_000).default(60_000),
   SQLITE_BUSY_TIMEOUT_MS: z.coerce.number().int().min(0).max(60_000).default(5_000),

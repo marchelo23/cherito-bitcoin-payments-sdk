@@ -70,7 +70,8 @@ export async function prepareWorkspace(): Promise<void> {
 export async function writeGatewayEnv(): Promise<void> {
   const intentKey = randomBytes(32).toString('base64')
   const lines = [
-    'NODE_ENV=test',
+    'NODE_ENV=development',
+    'WEBHOOK_ALLOW_PRIVATE_DESTINATIONS=true',
     'PORT=3100',
     'HOST=0.0.0.0',
     'LIGHTNING_PROVIDER=lnd',

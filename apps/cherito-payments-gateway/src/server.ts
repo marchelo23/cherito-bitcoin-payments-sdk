@@ -20,6 +20,7 @@ import { PaymentLinkService } from './services/payment-link-service.js'
 import { ApiKeyService } from './services/api-key-service.js'
 import { TenantService } from './services/tenant-service.js'
 import { WebhookService } from './services/webhook-service.js'
+import { WebhookTransport } from './services/webhook-transport.js'
 import { LndkProvider } from './services/lndk-provider.js'
 import { PaymentIntentSecretCipher } from './security/payment-intent-secret-cipher.js'
 import { createLightningProvider } from './services/lightning-provider-factory.js'
@@ -259,7 +260,14 @@ export async function buildServer(
   const webhookRepo = new WebhookRepository(config.DATABASE_URL, databaseOptions)
   const apiKeyService = new ApiKeyService(paymentIntentRepo)
   const tenantService = new TenantService(paymentIntentRepo, apiKeyService)
-  const webhookService = new WebhookService(webhookRepo, paymentIntentRepo, logger)
+  const webhookService = new WebhookService(
+    webhookRepo,
+    paymentIntentRepo,
+    logger,
+    new WebhookTransport({
+      allowPrivateAddresses: config.WEBHOOK_ALLOW_PRIVATE_DESTINATIONS,
+    }),
+  )
   const paymentIntentService = new PaymentIntentService(
     lnd,
     paymentIntentRepo,

@@ -144,6 +144,11 @@ export async function connectPeer(
   }
 }
 
+export async function listPeers(role: NodeRole): Promise<string[]> {
+  const result = await lndRest<{ peers?: Array<{ pub_key: string }> }>(role, '/v1/peers')
+  return (result.peers ?? []).map((peer) => peer.pub_key)
+}
+
 export async function openChannel(
   from: NodeRole,
   pubkeyHex: string,

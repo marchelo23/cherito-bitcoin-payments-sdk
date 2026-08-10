@@ -31,6 +31,7 @@ import {
   getInfo,
   getServerState,
   listChannels,
+  listPeers,
   newAddress,
   openChannel,
   readTlsCert,
@@ -183,12 +184,20 @@ export async function fundAndOpenChannel(): Promise<{
     return true
   }, { description: 'payer to connect to the merchant node', timeoutMs: TIMEOUTS.chain, intervalMs: 2_000 })
 
+  await waitFor(async () => {
+    const peers = await listPeers('payer')
+    return peers.includes(merchant.identity_pubkey) ? true : undefined
+  }, { description: 'merchant node to appear online as a payer peer', timeoutMs: TIMEOUTS.chain, intervalMs: 2_000 })
+
   const existing = (await listChannels('payer')).find(
     (channel) => channel.remote_pubkey === merchant.identity_pubkey,
   )
   const channelPoint = existing
     ? existing.chan_id
-    : await openChannel('payer', merchant.identity_pubkey, CHANNEL_CAPACITY_SATS, 0)
+    : await waitFor(
+      () => openChannel('payer', merchant.identity_pubkey, CHANNEL_CAPACITY_SATS, 0),
+      { description: 'channel funding to be accepted', timeoutMs: TIMEOUTS.chain, intervalMs: 3_000 },
+    )
 
   await waitFor(async () => {
     await mineBlocks(1)

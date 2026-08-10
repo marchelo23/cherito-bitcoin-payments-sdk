@@ -112,7 +112,7 @@ export async function relaxLndPermissions(service: 'lnd-merchant' | 'lnd-payer')
 }
 
 export async function startChainAndNodes(): Promise<void> {
-  await docker.up(['bitcoind', 'lnd-merchant', 'lnd-payer'])
+  await docker.up(['bitcoind'])
 
   await waitFor(async () => {
     await assertRegtest()
@@ -121,6 +121,10 @@ export async function startChainAndNodes(): Promise<void> {
 
   await ensureWallet()
 
+  const height = await getBlockCount()
+  if (height < 150) await mineBlocks(150 - height)
+
+  await docker.up(['lnd-merchant', 'lnd-payer'])
   await relaxLndPermissions('lnd-merchant')
   await relaxLndPermissions('lnd-payer')
 
@@ -130,11 +134,12 @@ export async function startChainAndNodes(): Promise<void> {
       return true
     }, { description: `lnd ${role} regtest identity`, timeoutMs: TIMEOUTS.service })
 
+    let lastState = 'unknown'
     await waitFor(async () => {
-      const serverState = await getServerState(role)
-      return serverState === 'SERVER_ACTIVE' ? serverState : undefined
+      lastState = await getServerState(role)
+      return lastState === 'SERVER_ACTIVE' ? lastState : undefined
     }, {
-      description: `lnd ${role} rpc server to reach SERVER_ACTIVE`,
+      description: () => `lnd ${role} rpc server to reach SERVER_ACTIVE (last state ${lastState})`,
       timeoutMs: TIMEOUTS.service,
       intervalMs: 2_000,
     })
@@ -146,9 +151,6 @@ export async function fundAndOpenChannel(): Promise<{
   payerPubkey: string
   channelPoint: string
 }> {
-  const height = await getBlockCount()
-  if (height < 150) await mineBlocks(150 - height)
-
   await waitFor(async () => (await getWalletBalance()) > PAYER_FUNDING_BTC + 1, {
     description: 'spendable regtest coins in the bitcoind wallet',
     timeoutMs: TIMEOUTS.chain,

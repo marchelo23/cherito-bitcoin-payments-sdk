@@ -1,5 +1,5 @@
 export interface WaitOptions {
-  description: string
+  description: string | (() => string)
   timeoutMs?: number
   intervalMs?: number
 }
@@ -29,9 +29,10 @@ export async function waitFor<T>(
     if (Date.now() >= deadline) {
       const elapsed = Date.now() - startedAt
       const detail = lastFailure ? ` last failure: ${lastFailure}` : ''
-      throw new Error(
-        `Timed out waiting for ${options.description} after ${elapsed}ms.${detail}`,
-      )
+      const label = typeof options.description === 'function'
+        ? options.description()
+        : options.description
+      throw new Error(`Timed out waiting for ${label} after ${elapsed}ms.${detail}`)
     }
 
     await delay(intervalMs)

@@ -10,7 +10,12 @@
     "test": "pnpm -r run test",
     "lint": "eslint .",
     "dev": "pnpm --filter cherito-payments-gateway run dev",
-    "db": "pnpm --filter cherito-payments-gateway run db --"
+    "db": "pnpm --filter cherito-payments-gateway run db --",
+    "test:e2e": "pnpm --filter @cherito/e2e run test:e2e",
+    "test:e2e:smoke": "pnpm --filter @cherito/e2e run test:e2e:smoke",
+    "regtest:test": "pnpm --filter @cherito/e2e run test:e2e",
+    "regtest:up": "pnpm --filter @cherito/e2e run regtest:up",
+    "regtest:down": "pnpm --filter @cherito/e2e run regtest:down"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.0",

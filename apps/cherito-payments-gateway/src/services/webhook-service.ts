@@ -177,9 +177,9 @@ export class WebhookService {
     }
   }
 
-  /** Start a background retry loop that runs every 30 seconds */
-  startRetryLoop(): () => void {
-    const timer = setInterval(() => void this.flush(), 30_000)
+  /** Start a background retry loop that runs every 30 seconds by default */
+  startRetryLoop(intervalMs = 30_000): () => void {
+    const timer = setInterval(() => void this.flush(), Math.max(100, intervalMs))
     this.deliveryTimer = timer
     return () => clearInterval(timer)
   }

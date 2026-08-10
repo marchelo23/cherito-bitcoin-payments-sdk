@@ -1,4 +1,8 @@
+import { writeFile } from 'node:fs/promises'
 import { PaymentIntentSecretCipher } from './security/payment-intent-secret-cipher.js'
+import { PaymentIntentRepository } from './persistence/payment-intent-repository.js'
+import { ApiKeyService } from './services/api-key-service.js'
+import { TenantService } from './services/tenant-service.js'
 import {
   createDatabaseBackup,
   restoreDatabaseBackup,
@@ -68,8 +72,33 @@ async function main(): Promise<void> {
     return
   }
 
+  if (command === 'tenant' && process.argv[3] === 'create') {
+    const repo = new PaymentIntentRepository(
+      argument('database') ?? process.env.DATABASE_URL ?? '',
+      intentSecretCipher(),
+      Number(process.env.SQLITE_BUSY_TIMEOUT_MS ?? 5_000),
+      process.env.DATABASE_BACKUP_DIR,
+    )
+    try {
+      const tenantService = new TenantService(repo, new ApiKeyService(repo))
+      const { tenant, apiKey } = await tenantService.createTenant({
+        name: requiredArgument('name'),
+        apiKeyLabel: argument('label') ?? 'operator',
+      })
+      await writeFile(
+        requiredArgument('key-out'),
+        `${JSON.stringify({ tenantId: tenant.id, apiKey })}\n`,
+        { mode: 0o600, flag: 'wx' },
+      )
+      writeSafeProcessEvent(process.stdout, 'info', 'TENANT_CREATED')
+    } finally {
+      repo.close()
+    }
+    return
+  }
+
   throw new Error(
-    'Usage: database-cli <backup|restore|validate> --database file:/path --output/--input /path',
+    'Usage: database-cli <backup|restore|validate|tenant create> --database file:/path --output/--input /path',
   )
 }
 

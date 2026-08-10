@@ -1,0 +1,176 @@
+name: cherito-e2e
+
+networks:
+  cherito-e2e:
+    name: cherito-e2e-net
+
+volumes:
+  bitcoind-data:
+    name: cherito-e2e-bitcoind
+  gateway-data:
+    name: cherito-e2e-gateway
+
+services:
+  bitcoind:
+    image: polarlightning/bitcoind:27.0
+    user: "0:0"
+    networks: [cherito-e2e]
+    ports:
+      - "127.0.0.1:18443:18443"
+    volumes:
+      - bitcoind-data:/data
+    command:
+      - bitcoind
+      - -datadir=/data
+      - -regtest=1
+      - -server=1
+      - -txindex=1
+      - -fallbackfee=0.0002
+      - -rpcbind=0.0.0.0
+      - -rpcport=18443
+      - -rpcallowip=0.0.0.0/0
+      - -rpcuser=cheritoe2e
+      - -rpcpassword=cheritoe2edisposable
+      - -zmqpubrawblock=tcp://0.0.0.0:28334
+      - -zmqpubrawtx=tcp://0.0.0.0:28335
+      - -dnsseed=0
+      - -upnp=0
+      - -listenonion=0
+      - -natpmp=0
+    healthcheck:
+      test:
+        - CMD
+        - bitcoin-cli
+        - -datadir=/data
+        - -regtest
+        - -rpcport=18443
+        - -rpcuser=cheritoe2e
+        - -rpcpassword=cheritoe2edisposable
+        - getblockchaininfo
+      interval: 3s
+      timeout: 5s
+      retries: 40
+    restart: "no"
+
+  lnd-merchant:
+    image: polarlightning/lnd:0.18.3-beta
+    user: "0:0"
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    networks: [cherito-e2e]
+    ports:
+      - "127.0.0.1:18080:8080"
+    volumes:
+      - ./.tmp/lnd-merchant:/lnd
+    command:
+      - lnd
+      - --lnddir=/lnd
+      - --noseedbackup
+      - --alias=e2e-merchant
+      - --listen=0.0.0.0:9735
+      - --rpclisten=0.0.0.0:10009
+      - --restlisten=0.0.0.0:8080
+      - --tlsextradomain=lnd-merchant
+      - --tlsextraip=127.0.0.1
+      - --bitcoin.active
+      - --bitcoin.regtest
+      - --bitcoin.node=bitcoind
+      - --bitcoind.rpchost=bitcoind:18443
+      - --bitcoind.rpcuser=cheritoe2e
+      - --bitcoind.rpcpass=cheritoe2edisposable
+      - --bitcoind.zmqpubrawblock=tcp://bitcoind:28334
+      - --bitcoind.zmqpubrawtx=tcp://bitcoind:28335
+      - --trickledelay=5000
+      - --maxpendingchannels=10
+      - --accept-keysend
+    healthcheck:
+      test: ["CMD", "lncli", "--lnddir=/lnd", "--network=regtest", "--rpcserver=localhost:10009", "getinfo"]
+      interval: 3s
+      timeout: 5s
+      retries: 60
+    restart: "no"
+
+  lnd-payer:
+    image: polarlightning/lnd:0.18.3-beta
+    user: "0:0"
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    networks: [cherito-e2e]
+    ports:
+      - "127.0.0.1:28080:8080"
+    volumes:
+      - ./.tmp/lnd-payer:/lnd
+    command:
+      - lnd
+      - --lnddir=/lnd
+      - --noseedbackup
+      - --alias=e2e-payer
+      - --listen=0.0.0.0:9735
+      - --rpclisten=0.0.0.0:10009
+      - --restlisten=0.0.0.0:8080
+      - --tlsextradomain=lnd-payer
+      - --tlsextraip=127.0.0.1
+      - --bitcoin.active
+      - --bitcoin.regtest
+      - --bitcoin.node=bitcoind
+      - --bitcoind.rpchost=bitcoind:18443
+      - --bitcoind.rpcuser=cheritoe2e
+      - --bitcoind.rpcpass=cheritoe2edisposable
+      - --bitcoind.zmqpubrawblock=tcp://bitcoind:28334
+      - --bitcoind.zmqpubrawtx=tcp://bitcoind:28335
+      - --trickledelay=5000
+      - --maxpendingchannels=10
+    healthcheck:
+      test: ["CMD", "lncli", "--lnddir=/lnd", "--network=regtest", "--rpcserver=localhost:10009", "getinfo"]
+      interval: 3s
+      timeout: 5s
+      retries: 60
+    restart: "no"
+
+  merchant-receiver:
+    build:
+      context: ./receiver
+    networks: [cherito-e2e]
+    ports:
+      - "127.0.0.1:14000:4000"
+    environment:
+      PORT: "4000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/__test/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+    restart: "no"
+
+  gateway:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    depends_on:
+      lnd-merchant:
+        condition: service_healthy
+      merchant-receiver:
+        condition: service_healthy
+    networks: [cherito-e2e]
+    ports:
+      - "127.0.0.1:13100:3100"
+    env_file:
+      - ./.tmp/gateway.env
+    volumes:
+      - gateway-data:/app/data
+      - ./.tmp/secrets:/run/secrets:ro
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3100/health"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 5s
+    restart: "no"

@@ -1,0 +1,19 @@
+{
+  "name": "@cherito/e2e",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:e2e": "tsx src/run.ts",
+    "test:e2e:smoke": "tsx src/run.ts --suite smoke",
+    "test:e2e:full": "tsx src/run.ts --suite full",
+    "regtest:up": "tsx src/run.ts --only-up",
+    "regtest:down": "tsx src/run.ts --only-down",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  }
+}

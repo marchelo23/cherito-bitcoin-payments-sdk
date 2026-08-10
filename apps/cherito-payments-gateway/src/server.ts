@@ -314,7 +314,7 @@ export async function buildServer(
   let stopWebhookRetry = () => {}
   if (dependencies.startBackgroundJobs !== false) {
     stopReconciliation = paymentIntentService.startReconciliationLoop()
-    stopWebhookRetry = webhookService.startRetryLoop()
+    stopWebhookRetry = webhookService.startRetryLoop(config.WEBHOOK_RETRY_INTERVAL_MS)
   }
 
   app.addHook('onClose', async () => {

@@ -29,6 +29,7 @@ import {
   bakeInvoiceMacaroon,
   connectPeer,
   getInfo,
+  getServerState,
   listChannels,
   newAddress,
   openChannel,
@@ -128,6 +129,15 @@ export async function startChainAndNodes(): Promise<void> {
       await assertRegtestNode(role)
       return true
     }, { description: `lnd ${role} regtest identity`, timeoutMs: TIMEOUTS.service })
+
+    await waitFor(async () => {
+      const serverState = await getServerState(role)
+      return serverState === 'SERVER_ACTIVE' ? serverState : undefined
+    }, {
+      description: `lnd ${role} rpc server to reach SERVER_ACTIVE`,
+      timeoutMs: TIMEOUTS.service,
+      intervalMs: 2_000,
+    })
   }
 }
 
@@ -165,7 +175,10 @@ export async function fundAndOpenChannel(): Promise<{
     timeoutMs: TIMEOUTS.chain,
   })
 
-  await connectPeer('payer', merchant.identity_pubkey, 'lnd-merchant:9735')
+  await waitFor(async () => {
+    await connectPeer('payer', merchant.identity_pubkey, 'lnd-merchant:9735')
+    return true
+  }, { description: 'payer to connect to the merchant node', timeoutMs: TIMEOUTS.chain, intervalMs: 2_000 })
 
   const existing = (await listChannels('payer')).find(
     (channel) => channel.remote_pubkey === merchant.identity_pubkey,

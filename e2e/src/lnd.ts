@@ -113,6 +113,11 @@ export async function assertRegtestNode(role: NodeRole): Promise<void> {
   }
 }
 
+export async function getServerState(role: NodeRole): Promise<string> {
+  const result = await lndRest<{ state: string }>(role, '/v1/state')
+  return result.state
+}
+
 export async function newAddress(role: NodeRole): Promise<string> {
   const result = await lndRest<{ address: string }>(role, '/v1/newaddress?type=WITNESS_PUBKEY_HASH')
   return result.address

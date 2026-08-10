@@ -7,3 +7,5 @@ dist
 data
 secrets
 *.log
+e2e/.tmp
+**/.tmp

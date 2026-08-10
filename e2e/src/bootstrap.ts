@@ -214,12 +214,8 @@ export async function installGatewayCredentials(): Promise<void> {
   const cert = await readTlsCert('merchant')
   await writeFile(resolve(SECRETS_DIR, 'lnd-tls.cert'), cert, { mode: 0o644 })
 
-  const macaroonBase64 = await bakeInvoiceMacaroon('merchant')
-  await writeFile(
-    resolve(SECRETS_DIR, 'cherito-invoice.macaroon'),
-    Buffer.from(macaroonBase64, 'base64'),
-    { mode: 0o644 },
-  )
+  const macaroon = await bakeInvoiceMacaroon('merchant')
+  await writeFile(resolve(SECRETS_DIR, 'cherito-invoice.macaroon'), macaroon, { mode: 0o644 })
 }
 
 export async function startGatewayAndReceiver(): Promise<void> {

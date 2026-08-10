@@ -232,7 +232,7 @@ export async function payInvoice(
   return result
 }
 
-export async function bakeInvoiceMacaroon(role: NodeRole): Promise<string> {
+export async function bakeInvoiceMacaroon(role: NodeRole): Promise<Buffer> {
   const result = await lndRest<{ macaroon: string }>(role, '/v1/macaroon', {
     method: 'POST',
     body: {
@@ -243,7 +243,11 @@ export async function bakeInvoiceMacaroon(role: NodeRole): Promise<string> {
       ],
     },
   })
-  return result.macaroon
+
+  const value = result.macaroon
+  if (!value) throw new Error(`lnd ${role} returned an empty baked macaroon`)
+  const isHex = /^[0-9a-fA-F]+$/.test(value) && value.length % 2 === 0
+  return Buffer.from(value, isHex ? 'hex' : 'base64')
 }
 
 export function base64ToHex(value: string): string {

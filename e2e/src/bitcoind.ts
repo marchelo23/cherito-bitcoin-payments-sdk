@@ -70,7 +70,7 @@ export async function ensureWallet(): Promise<void> {
     await bitcoinRpc('loadwallet', [BITCOIN_WALLET])
     return
   } catch {
-    await bitcoinRpc('createwallet', [BITCOIN_WALLET, false, false, '', false, false, true])
+    await bitcoinRpc('createwallet', [BITCOIN_WALLET, false, false, '', false, true, true])
   }
 }
 

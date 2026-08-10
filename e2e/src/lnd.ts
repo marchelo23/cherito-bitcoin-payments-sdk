@@ -223,7 +223,7 @@ export async function payInvoice(
 ): Promise<PaymentResult> {
   const result = await lndRest<PaymentResult>(role, '/v1/channels/transactions', {
     method: 'POST',
-    body: { payment_request: paymentRequest, timeout_seconds: 30 },
+    body: { payment_request: paymentRequest },
     timeoutMs,
   })
   if (result.payment_error) {

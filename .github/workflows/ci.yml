@@ -67,6 +67,26 @@ jobs:
     - name: Run regtest smoke suite
       run: pnpm run test:e2e:smoke
 
+    - name: Sanitize collected logs
+      if: failure()
+      run: |
+        if [ -d e2e/.tmp/logs ]; then
+          find e2e/.tmp/logs -type f -exec sed -i -E \
+            -e 's/sk_(live|test)_[A-Za-z0-9_-]+/sk_REDACTED/g' \
+            -e 's/cs_[A-Za-z0-9_-]+/cs_REDACTED/g' \
+            -e 's/whsec_[A-Za-z0-9_-]+/whsec_REDACTED/g' \
+            -e 's/[0-9a-f]{120,}/MACAROON_REDACTED/g' {} +
+        fi
+
+    - name: Upload regtest logs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: regtest-smoke-logs-${{ github.run_id }}
+        path: e2e/.tmp/logs
+        retention-days: 7
+        if-no-files-found: ignore
+
     - name: Tear down regtest environment
       if: always()
       run: |

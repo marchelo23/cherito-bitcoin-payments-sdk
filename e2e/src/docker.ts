@@ -69,7 +69,27 @@ export async function assertDockerAvailable(): Promise<void> {
 }
 
 export async function up(services: string[] = []): Promise<void> {
-  await composeOrThrow(['up', '-d', '--build', '--wait', ...services], { timeoutMs: 900_000 })
+  const result = await compose(['up', '-d', '--build', '--wait', ...services], { timeoutMs: 900_000 })
+  if (result.code === 0) return
+
+  const diagnostics = await describeFailure(services)
+  throw new Error(
+    `docker compose up failed (${result.code}).\n${result.stderr.slice(-600)}\n${diagnostics}`,
+  )
+}
+
+export async function describeFailure(services: string[] = []): Promise<string> {
+  const sections: string[] = []
+  const status = await compose(['ps', '-a', '--format', 'table {{.Service}}\t{{.Status}}\t{{.ExitCode}}'], { quiet: true })
+  sections.push(`--- container status ---\n${status.stdout}`)
+
+  const targets = services.length > 0 ? services : ['bitcoind', 'lnd-merchant', 'lnd-payer', 'gateway', 'merchant-receiver']
+  for (const service of targets) {
+    const logs = await compose(['logs', '--no-color', '--tail', '60', service], { quiet: true })
+    const body = (logs.stdout + logs.stderr).trim()
+    sections.push(`--- ${service} (last 60 lines) ---\n${body || '(no output)'}`)
+  }
+  return sections.join('\n')
 }
 
 export async function upNoWait(services: string[] = []): Promise<void> {

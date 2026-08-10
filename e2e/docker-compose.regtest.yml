@@ -34,9 +34,7 @@ services:
       - -zmqpubrawblock=tcp://0.0.0.0:28334
       - -zmqpubrawtx=tcp://0.0.0.0:28335
       - -dnsseed=0
-      - -upnp=0
-      - -listenonion=0
-      - -natpmp=0
+      - -listen=0
     healthcheck:
       test:
         - CMD

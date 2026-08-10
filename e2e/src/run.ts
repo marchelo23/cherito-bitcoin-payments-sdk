@@ -14,11 +14,13 @@ const SUITES: Record<string, string[]> = {
     'tests/authorization.test.ts',
     'tests/payment-links.test.ts',
     'tests/malformed-input.test.ts',
-    'tests/webhook-failures.test.ts',
-    'tests/restart.test.ts',
-    'tests/failure-injection.test.ts',
-    'tests/migration-restore.test.ts',
     'tests/log-secrets.test.ts',
+    'tests/webhook-failures.test.ts',
+    'tests/failure-injection.test.ts',
+    'tests/restart.test.ts',
+  ],
+  maintenance: [
+    'tests/migration-restore.test.ts',
   ],
 }
 
@@ -65,14 +67,25 @@ async function main(): Promise<void> {
     return
   }
 
-  process.stdout.write(`[e2e] running "${suiteName}" suite\n`)
+  process.stdout.write(`[e2e] running "${suiteName}" suite (${files.length} files, in order)\n`)
   const testsStartedAt = Date.now()
-  const result = await docker.run(
-    process.execPath,
-    ['--import', 'tsx', '--test', '--test-concurrency=1', ...files.map((file) => resolve(E2E_ROOT, file))],
-    { cwd: E2E_ROOT, timeoutMs: 3_600_000 },
-  )
+  const failed: string[] = []
+
+  for (const file of files) {
+    process.stdout.write(`\n[e2e] ---- ${file} ----\n`)
+    const fileResult = await docker.run(
+      process.execPath,
+      ['--import', 'tsx', '--test', '--test-concurrency=1', resolve(E2E_ROOT, file)],
+      { cwd: E2E_ROOT, timeoutMs: 1_800_000 },
+    )
+    if (fileResult.code !== 0) failed.push(file)
+  }
+
+  const result = { code: failed.length === 0 ? 0 : 1 }
   const testMs = Date.now() - testsStartedAt
+  if (failed.length > 0) {
+    process.stdout.write(`\n[e2e] failing files: ${failed.join(', ')}\n`)
+  }
 
   process.stdout.write(
     `\n[e2e] suite finished in ${Math.round(testMs / 1000)}s`

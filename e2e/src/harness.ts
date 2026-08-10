@@ -55,6 +55,23 @@ export async function waitForIntentStatus(
   })
 }
 
+export async function waitForIntentStatusIn(
+  intentId: string,
+  expected: string[],
+  timeoutMs: number = TIMEOUTS.settlement,
+): Promise<PaymentIntentResponse> {
+  const fixtures = await state()
+  return waitFor(async () => {
+    const result = await getMerchantIntent(fixtures.tenantA.apiKey, intentId)
+    if (result.status !== 200) return undefined
+    return expected.includes(result.body.status) ? result.body : undefined
+  }, {
+    description: `payment intent ${intentId} to reach one of [${expected.join(', ')}]`,
+    timeoutMs,
+    intervalMs: 1_000,
+  })
+}
+
 export async function assertProviderInvoiceSettled(
   paymentHashHex: string,
   amountSats: string,

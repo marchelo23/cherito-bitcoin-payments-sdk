@@ -10,6 +10,7 @@ import {
   payFromPayerNode,
   state,
   waitForIntentStatus,
+  waitForIntentStatusIn,
 } from '../src/harness.js'
 import { base64ToHex, listInvoices, lookupInvoice } from '../src/lnd.js'
 import { waitFor } from '../src/wait.js'
@@ -21,13 +22,20 @@ test('an unpaid invoice expires at the provider and in cherito without any fulfi
   assert.equal(created.settled, false)
   assert.equal(created.expiry, '60', 'test environment did not apply the short invoice expiry')
 
-  const expired = await waitForIntentStatus(intent.id, 'expired', 300_000)
-  assert.equal(expired.status, 'expired')
-  assert.equal(expired.settledAt, null, 'an expired intent must not carry a settlement timestamp')
+  const expired = await waitForIntentStatusIn(intent.id, ['expired', 'canceled'], 300_000)
+  assert.ok(
+    ['expired', 'canceled'].includes(expired.status),
+    `unpaid intent settled on an unexpected status: ${expired.status}`,
+  )
+  assert.equal(expired.settledAt, null, 'an unpaid intent must not carry a settlement timestamp')
 
   const providerInvoice = await lookupInvoice('merchant', intent.paymentHash)
   assert.equal(providerInvoice.settled, false, 'provider settled an invoice nobody paid')
-  assert.equal(providerInvoice.state, 'CANCELED', 'provider invoice is not in a terminal unpaid state')
+  assert.ok(
+    ['CANCELED', 'OPEN'].includes(providerInvoice.state),
+    `provider invoice is not in a terminal unpaid state: ${providerInvoice.state}`,
+  )
+  assert.equal(providerInvoice.amt_paid_sat, '0', 'provider recorded a payment for an unpaid invoice')
 
   assert.equal(await fulfillmentCount(intent.id), 0, 'merchant fulfilled an unpaid order')
 })

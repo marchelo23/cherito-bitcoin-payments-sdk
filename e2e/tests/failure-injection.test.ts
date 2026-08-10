@@ -3,7 +3,14 @@ import { test } from 'node:test'
 import * as docker from '../src/docker.js'
 import { GATEWAY_URL } from '../src/env.js'
 import { api, createPaymentIntent, health, receiverReset, receiverState } from '../src/gateway-client.js'
-import { newIntent, orderId, payFromPayerNode, state, waitForIntentStatus } from '../src/harness.js'
+import {
+  ensureChannelReady,
+  newIntent,
+  orderId,
+  payFromPayerNode,
+  state,
+  waitForIntentStatus,
+} from '../src/harness.js'
 import { assertRegtestNode, lookupInvoice } from '../src/lnd.js'
 import { delay, waitFor } from '../src/wait.js'
 
@@ -102,6 +109,8 @@ test('a provider outage produces a bounded failure rather than a phantom settlem
 
   const providerInvoice = await lookupInvoice('merchant', recovered.body.paymentHash)
   assert.equal(providerInvoice.value, '21500', 'recovered invoice does not match the provider record')
+
+  await ensureChannelReady()
 })
 
 test('an interrupted SSE stream can be resumed and still observes the terminal state once', { timeout: 500_000 }, async () => {

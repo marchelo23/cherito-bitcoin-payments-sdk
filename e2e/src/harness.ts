@@ -8,7 +8,7 @@ import {
   receiverState,
   type PaymentIntentResponse,
 } from './gateway-client.js'
-import { base64ToHex, lookupInvoice, payInvoice, listInvoices } from './lnd.js'
+import { base64ToHex, listChannels, listInvoices, lookupInvoice, payInvoice } from './lnd.js'
 import { waitFor } from './wait.js'
 
 let cachedState: E2EState | undefined
@@ -88,7 +88,25 @@ export async function assertProviderInvoiceCount(
   )
 }
 
+export async function ensureChannelReady(minimumSendableSats = 100_000): Promise<void> {
+  const fixtures = await state()
+  await waitFor(async () => {
+    const channels = await listChannels('payer')
+    const usable = channels.find(
+      (channel) => channel.remote_pubkey === fixtures.merchantPubkey
+        && channel.active
+        && BigInt(channel.local_balance) >= BigInt(minimumSendableSats),
+    )
+    return usable ?? undefined
+  }, {
+    description: `an active payer channel with at least ${minimumSendableSats} sendable sats`,
+    timeoutMs: TIMEOUTS.channel,
+    intervalMs: 2_000,
+  })
+}
+
 export async function payFromPayerNode(paymentRequest: string): Promise<string> {
+  await ensureChannelReady()
   const result = await payInvoice('payer', paymentRequest)
   assert.ok(result.payment_preimage, 'payer node returned no preimage')
   return base64ToHex(result.payment_hash)

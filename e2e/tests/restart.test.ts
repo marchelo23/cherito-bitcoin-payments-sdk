@@ -8,6 +8,7 @@ import {
   receiverSetMode,
   receiverState,
 } from '../src/gateway-client.js'
+import { relaxLndPermissions } from '../src/bootstrap.js'
 import { newIntent, payFromPayerNode, state, waitForIntentStatus } from '../src/harness.js'
 import { assertRegtestNode, lookupInvoice } from '../src/lnd.js'
 import { waitFor } from '../src/wait.js'
@@ -92,6 +93,7 @@ test('the gateway tolerates a provider outage and settles once the node returns'
   const intent = await newIntent('19500')
 
   await docker.restartService('lnd-merchant')
+  await relaxLndPermissions('lnd-merchant')
 
   await waitFor(async () => {
     await assertRegtestNode('merchant')

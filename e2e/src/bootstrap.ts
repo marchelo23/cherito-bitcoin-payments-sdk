@@ -103,6 +103,13 @@ export async function writeGatewayEnv(): Promise<void> {
   await writeFile(GATEWAY_ENV_FILE, `${lines.join('\n')}\n`, { mode: 0o600 })
 }
 
+export async function relaxLndPermissions(service: 'lnd-merchant' | 'lnd-payer'): Promise<void> {
+  await waitFor(async () => {
+    const result = await docker.exec(service, ['chmod', '-R', 'a+rX', '/lnd'], true)
+    return result.code === 0 ? true : undefined
+  }, { description: `${service} credentials to become host-readable`, timeoutMs: 120_000, intervalMs: 2_000 })
+}
+
 export async function startChainAndNodes(): Promise<void> {
   await docker.up(['bitcoind', 'lnd-merchant', 'lnd-payer'])
 
@@ -112,6 +119,9 @@ export async function startChainAndNodes(): Promise<void> {
   }, { description: 'bitcoind regtest RPC', timeoutMs: TIMEOUTS.service })
 
   await ensureWallet()
+
+  await relaxLndPermissions('lnd-merchant')
+  await relaxLndPermissions('lnd-payer')
 
   for (const role of ['merchant', 'payer'] as const) {
     await waitFor(async () => {

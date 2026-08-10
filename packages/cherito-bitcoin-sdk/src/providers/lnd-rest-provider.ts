@@ -149,7 +149,7 @@ export class LndRestProvider implements LightningReceiveProvider {
     if (!/^[0-9a-f]{64}$/i.test(hash)) {
       throw new TypeError('Payment hash must contain 32 bytes of hexadecimal data')
     }
-    const x = await this.request(`/v1/invoice/${Buffer.from(hash, 'hex').toString('base64url')}`)
+    const x = await this.request(`/v1/invoice/${hash.toLowerCase()}`)
     const createdMs = Number(x.creation_date) * 1000
     const expiresAt = new Date(createdMs + Number(x.expiry) * 1000).toISOString()
     return {

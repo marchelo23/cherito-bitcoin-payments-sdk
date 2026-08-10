@@ -5,20 +5,17 @@ networks:
     name: cherito-e2e-net
 
 volumes:
-  bitcoind-data:
-    name: cherito-e2e-bitcoind
   gateway-data:
     name: cherito-e2e-gateway
 
 services:
   bitcoind:
     image: polarlightning/bitcoind:27.0
-    user: "0:0"
     networks: [cherito-e2e]
     ports:
       - "127.0.0.1:18443:18443"
     volumes:
-      - bitcoind-data:/data
+      - ./.tmp/bitcoind:/data
     command:
       - bitcoind
       - -datadir=/data
@@ -52,7 +49,6 @@ services:
 
   lnd-merchant:
     image: polarlightning/lnd:0.18.3-beta
-    user: "0:0"
     depends_on:
       bitcoind:
         condition: service_healthy
@@ -91,7 +87,6 @@ services:
 
   lnd-payer:
     image: polarlightning/lnd:0.18.3-beta
-    user: "0:0"
     depends_on:
       bitcoind:
         condition: service_healthy

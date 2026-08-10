@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto'
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import {
   assertRegtest,
@@ -11,6 +11,7 @@ import {
 } from './bitcoind.js'
 import * as docker from './docker.js'
 import {
+  BITCOIND_DIR,
   CHANNEL_CAPACITY_SATS,
   GATEWAY_ENV_FILE,
   LOG_DIR,
@@ -59,10 +60,10 @@ export interface E2EState {
 
 export async function prepareWorkspace(): Promise<void> {
   await rm(TMP_DIR, { recursive: true, force: true })
-  await mkdir(MERCHANT_LND_DIR, { recursive: true })
-  await mkdir(PAYER_LND_DIR, { recursive: true })
-  await mkdir(SECRETS_DIR, { recursive: true })
-  await mkdir(LOG_DIR, { recursive: true })
+  for (const directory of [BITCOIND_DIR, MERCHANT_LND_DIR, PAYER_LND_DIR, SECRETS_DIR, LOG_DIR]) {
+    await mkdir(directory, { recursive: true })
+    await chmod(directory, 0o777)
+  }
 }
 
 export async function writeGatewayEnv(): Promise<void> {
@@ -185,13 +186,13 @@ export async function fundAndOpenChannel(): Promise<{
 
 export async function installGatewayCredentials(): Promise<void> {
   const cert = await readTlsCert('merchant')
-  await writeFile(resolve(SECRETS_DIR, 'lnd-tls.cert'), cert, { mode: 0o600 })
+  await writeFile(resolve(SECRETS_DIR, 'lnd-tls.cert'), cert, { mode: 0o644 })
 
   const macaroonBase64 = await bakeInvoiceMacaroon('merchant')
   await writeFile(
     resolve(SECRETS_DIR, 'cherito-invoice.macaroon'),
     Buffer.from(macaroonBase64, 'base64'),
-    { mode: 0o600 },
+    { mode: 0o644 },
   )
 }
 

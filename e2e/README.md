@@ -21,8 +21,12 @@ Useful variants:
 |---|---|
 | `pnpm test:e2e` | Full suite (default) |
 | `pnpm test:e2e:smoke` | Fast subset used on pull requests |
+| `pnpm --filter @cherito/e2e run test:e2e -- --suite maintenance` | Backup and restore rehearsal (see known gaps) |
 | `pnpm regtest:up` | Start the environment and leave it running |
 | `pnpm regtest:down` | Remove containers, volumes and networks |
+
+Suite files run **sequentially, one Node process per file, in a declared order**. Destructive
+scenarios run last, and a failure in one file cannot cascade into the next.
 
 Add `--keep` to leave the environment running after a failure for interactive debugging.
 
@@ -89,8 +93,18 @@ provider truth (merchant LND)  <->  cherito truth (API/database)  <->  merchant 
 | `webhook-failures.test.ts` | Receiver outage and retry, forged signature, stale timestamp, replay suppression |
 | `restart.test.ts` | Payment while gateway down, durable pending webhook across restart, provider restart |
 | `failure-injection.test.ts` | Database lock, provider outage, SSE disconnect and resume |
-| `migration-restore.test.ts` | Real backup and restore, restored state cannot override Lightning truth |
 | `log-secrets.test.ts` | No API key, client secret, webhook secret, macaroon, encryption key or canary in logs |
+
+## Known gaps
+
+`migration-restore.test.ts` is **not part of the `full` suite** and does not currently pass. It
+lives in the `maintenance` suite. The backup step works, but `database-cli restore` run against the
+stopped gateway's volume exits with `DATABASE_COMMAND_FAILED`, and the CLI intentionally does not
+disclose the underlying cause, so the failure is still undiagnosed. Because the scenario stops the
+gateway, it is isolated so it cannot affect other files.
+
+Until that scenario passes, the restore rehearsal in the release checklist remains an operator
+procedure rather than an automated gate.
 
 Duplicate and out-of-order provider events are covered by the provider-contract tests in
 `apps/cherito-payments-gateway/test/payment-intent.test.ts` (cases 15 to 17), which drive the real

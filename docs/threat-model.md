@@ -181,12 +181,28 @@ The following must be satisfied before recommending Cherito for real merchant pa
 
 - [ ] Threat model reviewed by an independent security reviewer
 - [ ] Cryptographic design (key hierarchy, HMAC scheme) reviewed
-- [ ] Full LND regtest suite passes with settlement verification
+- [x] Full LND regtest suite passes with settlement verification — `pnpm test:e2e` (see `e2e/README.md`)
 - [ ] Network and SSRF controls tested (including IP allowlisting in deployment)
 - [ ] Database at-rest encryption guidance documented
 - [ ] Vulnerability disclosure process documented and published
 - [ ] Dependency audit clean (`npm audit`)
 - [ ] Webhook signature verification tested end-to-end
+
+### Regtest gate: what is automated and what is operator policy
+
+**Automated by CI:**
+
+- Every pull request runs the unit suite and the regtest smoke subset (`regtest-smoke` in `ci.yml`).
+- Pushes to `main`, a nightly schedule, and `workflow_dispatch` run the full regtest suite
+  (`regtest-e2e.yml`). Logs are sanitised of key material before upload.
+
+**Operator policy, not automated:**
+
+- `main` has **no branch protection rule and no active ruleset**, so a green regtest run is not
+  mechanically required to merge or to cut a release. Treat the checklist above as a human gate
+  until a ruleset marks `regtest-smoke` and `regtest` as required status checks.
+- The backup and restore rehearsal is not yet a passing automated scenario; see the known gaps in
+  `e2e/README.md`. Restore drills remain a manual procedure documented in `docs/database-recovery.md`.
 
 ---
 

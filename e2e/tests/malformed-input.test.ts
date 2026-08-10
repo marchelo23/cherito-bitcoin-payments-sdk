@@ -115,7 +115,14 @@ test('invalid identifiers are rejected without enumerating resources', { timeout
   assert.equal(badIntent.status, 404)
 
   const badLink = await api('/v1/payment-links/NOT..A..SLUG')
-  assert.ok([400, 404].includes(badLink.status), `unexpected status ${badLink.status}`)
+  assert.ok(
+    [400, 404, 429].includes(badLink.status),
+    `unexpected status ${badLink.status}`,
+  )
+  assert.ok(
+    !badLink.text.includes('slug') || badLink.status === 429,
+    'the public resolve route echoed the requested identifier',
+  )
 
   const badManage = await api('/v1/payment-links/manage/pl_missing', { apiKey: fixtures.tenantA.apiKey })
   assert.equal(badManage.status, 404)

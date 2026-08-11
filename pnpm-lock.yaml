@@ -18,6 +18,8 @@ importers:
         specifier: ^8.46.0
         version: 8.66.0(eslint@9.39.5)(typescript@5.9.3)
 
+  apps/cherito-demo-store: {}
+
   apps/cherito-payments-gateway:
     dependencies:
       '@cherito/bitcoin-sdk':

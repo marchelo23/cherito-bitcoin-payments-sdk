@@ -1,0 +1,82 @@
+name: Regtest E2E
+
+on:
+  push:
+    branches: [ main ]
+  schedule:
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Suite to run
+        required: false
+        default: full
+        type: choice
+        options: [full, smoke]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: regtest-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v3
+        with:
+          version: 10
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Show docker environment
+        run: |
+          docker version
+          docker compose version
+
+      - name: Run regtest end-to-end suite
+        run: pnpm --filter @cherito/e2e run test:e2e -- --suite ${{ inputs.suite || 'full' }}
+
+      - name: Sanitize collected logs
+        if: failure()
+        run: |
+          if [ -d e2e/.tmp/logs ]; then
+            find e2e/.tmp/logs -type f -exec sed -i -E \
+              -e 's/sk_(live|test)_[A-Za-z0-9_-]+/sk_REDACTED/g' \
+              -e 's/cs_[A-Za-z0-9_-]+/cs_REDACTED/g' \
+              -e 's/whsec_[A-Za-z0-9_-]+/whsec_REDACTED/g' \
+              -e 's/[0-9a-f]{120,}/MACAROON_REDACTED/g' {} +
+          fi
+
+      - name: Upload regtest logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regtest-logs-${{ github.run_id }}
+          path: e2e/.tmp/logs
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Tear down regtest environment
+        if: always()
+        run: pnpm --filter @cherito/e2e run regtest:down || true
+
+      - name: Prune docker resources
+        if: always()
+        run: |
+          docker compose -p cherito-e2e -f e2e/docker-compose.regtest.yml down -v --remove-orphans || true
+          docker system prune -af --volumes || true

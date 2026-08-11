@@ -41,3 +41,54 @@ jobs:
         
     - name: Run Tests
       run: pnpm test
+
+  regtest-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    needs: build-and-test
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install pnpm
+      uses: pnpm/action-setup@v3
+      with:
+        version: 10
+
+    - name: Use Node.js 22
+      uses: actions/setup-node@v4
+      with:
+        node-version: 22.x
+        cache: 'pnpm'
+
+    - name: Install dependencies
+      run: pnpm install --frozen-lockfile
+
+    - name: Run regtest smoke suite
+      run: pnpm run test:e2e:smoke
+
+    - name: Sanitize collected logs
+      if: failure()
+      run: |
+        if [ -d e2e/.tmp/logs ]; then
+          find e2e/.tmp/logs -type f -exec sed -i -E \
+            -e 's/sk_(live|test)_[A-Za-z0-9_-]+/sk_REDACTED/g' \
+            -e 's/cs_[A-Za-z0-9_-]+/cs_REDACTED/g' \
+            -e 's/whsec_[A-Za-z0-9_-]+/whsec_REDACTED/g' \
+            -e 's/[0-9a-f]{120,}/MACAROON_REDACTED/g' {} +
+        fi
+
+    - name: Upload regtest logs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: regtest-smoke-logs-${{ github.run_id }}
+        path: e2e/.tmp/logs
+        retention-days: 7
+        if-no-files-found: ignore
+
+    - name: Tear down regtest environment
+      if: always()
+      run: |
+        pnpm run regtest:down || true
+        docker system prune -af --volumes || true

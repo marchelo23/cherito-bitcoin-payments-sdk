@@ -712,6 +712,52 @@ export async function buildServer(
     return reply.code(201).send(result)
   })
 
+  app.get('/v1/payment-intents', async (request, reply) => {
+    const auth = merchantAuth(request)
+    if (!auth) {
+      return reply.code(401).send({ code: 'UNAUTHORIZED', message: 'Valid merchant API key required' })
+    }
+    requestTenants.set(request, auth.tenantId)
+    if (rateLimited(policies.webhookManagement, `${auth.tenantId}:${request.ip}`)) {
+      return reply.code(429).send({ code: 'RATE_LIMITED', message: 'Too many requests' })
+    }
+    const query = boundedListQuery.parse(request.query)
+    const items = paymentIntentService.listMerchantIntents(auth.tenantId, query.limit, query.after)
+    return { items, next: items.length === query.limit ? items.at(-1)?.id : undefined }
+  })
+
+  app.get('/v1/payment-intents/summary', async (request, reply) => {
+    const auth = merchantAuth(request)
+    if (!auth) {
+      return reply.code(401).send({ code: 'UNAUTHORIZED', message: 'Valid merchant API key required' })
+    }
+    requestTenants.set(request, auth.tenantId)
+    if (rateLimited(policies.webhookManagement, `${auth.tenantId}:${request.ip}`)) {
+      return reply.code(429).send({ code: 'RATE_LIMITED', message: 'Too many requests' })
+    }
+    return paymentIntentService.merchantTotals(auth.tenantId)
+  })
+
+  app.get('/v1/api-keys', async (request, reply) => {
+    const auth = merchantAuth(request)
+    if (!auth) {
+      return reply.code(401).send({ code: 'UNAUTHORIZED', message: 'Valid merchant API key required' })
+    }
+    requestTenants.set(request, auth.tenantId)
+    if (rateLimited(policies.webhookManagement, `${auth.tenantId}:${request.ip}`)) {
+      return reply.code(429).send({ code: 'RATE_LIMITED', message: 'Too many requests' })
+    }
+    const query = boundedListQuery.parse(request.query)
+    const items = paymentIntentRepo.listApiKeys(auth.tenantId, query.limit).map((key) => ({
+      id: key.id,
+      keyPrefix: key.keyPrefix,
+      label: key.label,
+      createdAt: key.createdAt,
+      revokedAt: key.revokedAt,
+    }))
+    return { items }
+  })
+
   app.get<{ Params: { id: string } }>('/v1/payment-intents/:id', async (request, reply) => {
     const auth = merchantAuth(request)
     if (!auth) {

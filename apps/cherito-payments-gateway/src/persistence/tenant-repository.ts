@@ -123,6 +123,18 @@ export class TenantRepository {
       .get(keyHash) as MerchantApiKey | undefined
   }
 
+  listApiKeys(tenantId: string, limit = 100): Omit<MerchantApiKey, 'keyHash'>[] {
+    const bounded = Math.max(1, Math.min(100, Math.trunc(limit)))
+    return this.db
+      .prepare(`
+        SELECT id, tenant_id tenantId, key_prefix keyPrefix, label, created_at createdAt,
+               revoked_at revokedAt
+        FROM merchant_api_keys WHERE tenant_id=?
+        ORDER BY created_at DESC, id DESC LIMIT ?
+      `)
+      .all(tenantId, bounded) as Omit<MerchantApiKey, 'keyHash'>[]
+  }
+
   revokeApiKey(keyId: string, tenantId: string): void {
     // Tenant-scoped revocation prevents cross-tenant revocation
     this.db

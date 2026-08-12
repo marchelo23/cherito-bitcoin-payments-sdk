@@ -243,6 +243,25 @@ export class PaymentIntentService {
     return intent ? this.toMerchant(intent) : undefined
   }
 
+  listMerchantIntents(
+    tenantId: string,
+    limit: number,
+    afterId?: string,
+  ): PaymentIntentMerchantView[] {
+    return this.repo
+      .listPaymentIntents(tenantId, limit, afterId)
+      .map((intent) => this.toMerchant(intent))
+  }
+
+  merchantTotals(tenantId: string): {
+    settledCount: number
+    settledVolumeSats: string
+    pendingCount: number
+    failedCount: number
+  } {
+    return this.repo.paymentIntentTotals(tenantId)
+  }
+
   authorizeClient(
     tenantId: string,
     intentId: string,

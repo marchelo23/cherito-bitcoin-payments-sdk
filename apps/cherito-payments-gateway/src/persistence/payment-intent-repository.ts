@@ -546,6 +546,55 @@ export class PaymentIntentRepository extends TenantRepository {
     return row ? this.materialize(row) : undefined
   }
 
+  listPaymentIntents(tenantId: string, limit: number, afterId?: string): PaymentIntent[] {
+    const bounded = Math.max(1, Math.min(100, Math.trunc(limit)))
+    if (!afterId) {
+      const rows = this.db.prepare(`
+        SELECT ${PAYMENT_INTENT_COLUMNS} FROM payment_intents
+        WHERE tenant_id=? ORDER BY created_at DESC, id DESC LIMIT ?
+      `).all(tenantId, bounded) as unknown as StoredPaymentIntent[]
+      return rows.map((row) => this.materialize(row))
+    }
+    const cursor = this.db.prepare(`
+      SELECT created_at createdAt, id FROM payment_intents WHERE tenant_id=? AND id=?
+    `).get(tenantId, afterId) as { createdAt: string; id: string } | undefined
+    if (!cursor) return []
+    const rows = this.db.prepare(`
+      SELECT ${PAYMENT_INTENT_COLUMNS} FROM payment_intents
+      WHERE tenant_id=? AND (created_at < ? OR (created_at=? AND id < ?))
+      ORDER BY created_at DESC, id DESC LIMIT ?
+    `).all(
+      tenantId,
+      cursor.createdAt,
+      cursor.createdAt,
+      cursor.id,
+      bounded,
+    ) as unknown as StoredPaymentIntent[]
+    return rows.map((row) => this.materialize(row))
+  }
+
+  paymentIntentTotals(tenantId: string): {
+    settledCount: number
+    settledVolumeSats: string
+    pendingCount: number
+    failedCount: number
+  } {
+    const row = this.db.prepare(`
+      SELECT
+        COALESCE(SUM(CASE WHEN status='succeeded' THEN 1 ELSE 0 END), 0) settledCount,
+        COALESCE(SUM(CASE WHEN status='succeeded' THEN CAST(amount_sats AS INTEGER) ELSE 0 END), 0) settledVolumeSats,
+        COALESCE(SUM(CASE WHEN status IN ('requires_payment','processing') THEN 1 ELSE 0 END), 0) pendingCount,
+        COALESCE(SUM(CASE WHEN status IN ('expired','canceled','failed') THEN 1 ELSE 0 END), 0) failedCount
+      FROM payment_intents WHERE tenant_id=?
+    `).get(tenantId) as Record<string, number>
+    return {
+      settledCount: Number(row.settledCount ?? 0),
+      settledVolumeSats: String(row.settledVolumeSats ?? 0),
+      pendingCount: Number(row.pendingCount ?? 0),
+      failedCount: Number(row.failedCount ?? 0),
+    }
+  }
+
   nonTerminalPaymentIntents(limit?: number): PaymentIntent[] {
     const sql = `SELECT ${PAYMENT_INTENT_COLUMNS}
       FROM payment_intents
